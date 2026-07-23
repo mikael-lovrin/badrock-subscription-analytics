@@ -1,4 +1,4 @@
-name: Test2
+name: Test3
 on:
   schedule:
     - cron: "0 * * * *"
@@ -11,11 +11,41 @@ concurrency:
   group: pages
   cancel-in-progress: true
 jobs:
-  hello:
+  refresh-and-deploy:
     runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ETL dependencies
+        working-directory: etl
+        run: pip install -r requirements.txt
+      - name: Run ETL
+        working-directory: etl
+        env:
+          SHOPIFY_SHOP_DOMAIN: ${{ vars.SHOPIFY_SHOP_DOMAIN }}
+          SHOPIFY_CLIENT_ID: ${{ secrets.SHOPIFY_CLIENT_ID }}
+          SHOPIFY_CLIENT_SECRET: ${{ secrets.SHOPIFY_CLIENT_SECRET }}
+          SHOPIFY_API_VERSION: ${{ vars.SHOPIFY_API_VERSION }}
+        run: python run.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: site/package-lock.json
+      - name: Install site dependencies
+        working-directory: site
+        run: npm ci
+      - name: Build site
+        working-directory: site
+        run: npm run build
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/dist
       - id: deployment
-        run: echo hello
+        uses: actions/deploy-pages@v4

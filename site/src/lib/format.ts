@@ -25,7 +25,14 @@ export function formatRelativeTime(isoTimestamp: string): string {
   return `${diffDays}d ago`;
 }
 
-/** Plan labels come from the backend as "monthly" / "bimonthly" / etc. — this just title-cases them for display. */
+/**
+ * Plan labels come from metricsEngine as "monthly" / "bimonthly" /
+ * "trimonthly" / "unknown". "unknown" covers line items priced outside the
+ * three standard plan prices ($49/$88/$117) — in practice this is mostly
+ * discount/promo-code orders (e.g. $39, $69, $105.30), not a systematic
+ * new plan; see PLAN_BY_PRICE in metricsEngine.ts.
+ */
 export function formatPlanLabel(plan: string): string {
+  if (plan === "unknown") return "Other (custom price)";
   return plan.charAt(0).toUpperCase() + plan.slice(1);
 }

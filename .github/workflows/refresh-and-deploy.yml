@@ -1,9 +1,11 @@
 name: Refresh data and deploy
 
-# Runs hourly: pulls fresh data from Shopify + Appstle, recomputes every
-# metric, rebuilds the static site against that fresh JSON, and deploys it
-# to GitHub Pages. Nothing is committed back to the repo — the JSON is only
-# a build input (see etl/run.py's "stateless, full-refresh" design note).
+# Runs hourly: pulls fresh Shopify order/customer data, cleans it (drops
+# internal test orders), exports it as JSON, and rebuilds the static site
+# against that fresh JSON (every metric is computed client-side — see
+# site/src/lib/metricsEngine.ts) before deploying to GitHub Pages. Nothing
+# is committed back to the repo — the JSON is only a build input (see
+# etl/run.py's "stateless, full-refresh" design note).
 on:
   schedule:
     - cron: "0 * * * *"
@@ -35,14 +37,13 @@ jobs:
         working-directory: etl
         run: pip install -r requirements.txt
 
-      - name: Run ETL (pull Shopify + Appstle, compute metrics, export JSON)
+      - name: Run ETL (pull Shopify, clean, export raw JSON)
         working-directory: etl
         env:
           SHOPIFY_SHOP_DOMAIN: ${{ vars.SHOPIFY_SHOP_DOMAIN }}
           SHOPIFY_CLIENT_ID: ${{ secrets.SHOPIFY_CLIENT_ID }}
           SHOPIFY_CLIENT_SECRET: ${{ secrets.SHOPIFY_CLIENT_SECRET }}
           SHOPIFY_API_VERSION: ${{ vars.SHOPIFY_API_VERSION }}
-          APPSTLE_API_KEY: ${{ secrets.APPSTLE_API_KEY }}
         run: python run.py
 
       - uses: actions/setup-node@v4

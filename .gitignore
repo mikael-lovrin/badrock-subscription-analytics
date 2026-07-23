@@ -1,7 +1,8 @@
 .env
-etl/.scratch.db
+full_order_data_for_review.json
 site/node_modules/
 site/dist/
 site/public/data/*.json
+site/*.tsbuildinfo
 __pycache__/
 *.pyc

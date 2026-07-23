@@ -3,6 +3,8 @@ import ReactDOM from "react-dom/client";
 import { HashRouter } from "react-router-dom";
 import App from "./App";
 import "./index.css";
+import { FilterProvider } from "./lib/FilterContext";
+import { RawDataProvider } from "./lib/RawDataContext";
 
 // HashRouter (not BrowserRouter) on purpose: the site is deployed as a
 // static GitHub Pages build with a relative `base: "./"` (see
@@ -13,7 +15,11 @@ import "./index.css";
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <HashRouter>
-      <App />
+      <RawDataProvider>
+        <FilterProvider>
+          <App />
+        </FilterProvider>
+      </RawDataProvider>
     </HashRouter>
   </React.StrictMode>,
 );

@@ -1,21 +1,19 @@
 import type { ReactNode } from "react";
-import type { Envelope } from "../lib/types";
+import { useRawDataContext } from "../lib/RawDataContext";
+import type { RawData } from "../lib/useRawData";
 
-type LoadState<T> =
-  | { status: "loading" }
-  | { status: "error"; error: string }
-  | { status: "ready"; envelope: Envelope<T> };
-
-interface DataBoundaryProps<T> {
-  state: LoadState<T>;
-  children: (data: T, generatedAt: string) => ReactNode;
+interface DataBoundaryProps {
+  children: (data: RawData) => ReactNode;
 }
 
 /**
- * Shared loading/error/ready branching for every page — keeps pages from
- * repeating the same three-state switch on every useJson() call.
+ * Loading/error/ready branching for the single raw-data fetch (see
+ * RawDataContext) every page depends on — pages compute their own metrics
+ * from `data` via metricsEngine.ts once this resolves.
  */
-export function DataBoundary<T>({ state, children }: DataBoundaryProps<T>) {
+export function DataBoundary({ children }: DataBoundaryProps) {
+  const state = useRawDataContext();
+
   if (state.status === "loading") {
     return <div className="py-16 text-center text-sm text-gray-400">Loading data...</div>;
   }
@@ -26,5 +24,5 @@ export function DataBoundary<T>({ state, children }: DataBoundaryProps<T>) {
       </div>
     );
   }
-  return <>{children(state.envelope.data, state.envelope.generated_at)}</>;
+  return <>{children(state.data)}</>;
 }

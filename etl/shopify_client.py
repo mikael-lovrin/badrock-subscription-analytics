@@ -1,11 +1,14 @@
 """
 Shopify Admin GraphQL client.
 
-Pulls orders, customers, and line items. Subscription lifecycle data does
-NOT come from here — Badrock's recurring billing runs on the Appstle
-Subscriptions app, not native Shopify Subscriptions, so subscription truth
-lives in appstle_client.py. This module only covers what Shopify itself is
-the source of truth for: order/customer/revenue facts.
+Pulls orders, customers, and line items. Badrock's Appstle plan doesn't
+include External API access (confirmed 2026-07-23 — 401 on every Appstle
+Admin endpoint, and not worth upgrading for), so subscription lifecycle
+truth is reconstructed entirely from Shopify order data instead: Appstle
+tags every order it creates with `appstle_subscription_first_order` or
+`appstle_subscription_recurring_order` (pulled here via the `tags` field),
+which is what load.py uses to tell a subscription's first order from its
+renewals — see load.derive_subscriptions_from_orders().
 
 Auth: OAuth client-credentials grant (no redirect URI). The access token is
 short-lived (~24h) and is re-fetched fresh at the start of every run rather
@@ -91,10 +94,13 @@ class ShopifyClient:
                 name
                 createdAt
                 displayFinancialStatus
+                tags
                 currentTotalPriceSet { shopMoney { amount } }
                 customer {
                   id
                   email
+                  firstName
+                  lastName
                   defaultAddress { city provinceCode countryCode }
                 }
                 lineItems(first: 50) {
@@ -102,6 +108,7 @@ class ShopifyClient:
                     node {
                       id
                       title
+                      variantTitle
                       quantity
                       originalUnitPriceSet { shopMoney { amount } }
                     }

@@ -1,28 +1,33 @@
 """
-ETL entrypoint: pull -> load -> compute -> export.
+ETL entrypoint: pull -> clean -> export raw JSON.
 
 Run manually with:  python run.py
 Run in CI: the hourly GitHub Actions workflow calls this exact script.
 
-Deliberately stateless (see the "Stateless, full-refresh ETL" note in the
-project plan): every run builds a brand-new scratch SQLite database from a
-full pull of both APIs, computes metrics against it, writes the JSON
-export, then discards the database. Nothing persists between runs.
+Deliberately does no metric computation itself: it pulls Shopify orders and
+customers, filters out internal test orders (see load.is_test_order), tags
+each order with Appstle's own first-order/renewal signal, and writes the
+cleaned rows straight to JSON. Every metric (MRR, churn-by-cycle, cohort
+retention, revenue trend, etc.) is computed client-side in
+site/src/lib/metricsEngine.ts, reactively, against whatever product
+selection and date range the user has picked in the UI — that's what makes
+the site's multi-product + date-range filters possible without a backend.
+
+Subscription lifecycle data comes entirely from Shopify order history now:
+Badrock's Appstle plan doesn't include External API access (confirmed
+2026-07-23, and not worth upgrading for), but Appstle tags every order it
+creates with `appstle_subscription_first_order` or
+`appstle_subscription_recurring_order` — see load.py's docstring for how
+that's used.
 """
 from __future__ import annotations
 
+import json
 import time
+from datetime import datetime, timezone
 
-import db
 import load
-from appstle_client import AppstleClient
-from config import (
-    EXPORT_DIR,
-    SCRATCH_DB_PATH,
-    load_appstle_config,
-    load_shopify_config,
-)
-from export import export_all
+from config import EXPORT_DIR, load_shopify_config
 from shopify_client import ShopifyClient
 
 
@@ -30,7 +35,6 @@ def main() -> None:
     started = time.monotonic()
 
     shopify = ShopifyClient(load_shopify_config())
-    appstle = AppstleClient(load_appstle_config())
 
     print("Pulling Shopify orders...")
     order_nodes = list(shopify.iter_orders())
@@ -40,38 +44,32 @@ def main() -> None:
     customer_nodes = list(shopify.iter_customers())
     print(f"  {len(customer_nodes)} customers")
 
-    print("Pulling Appstle subscription contracts...")
-    contract_nodes = list(appstle.iter_contracts())
-    print(f"  {len(contract_nodes)} contracts")
-
-    print("Pulling Appstle billing attempts (looped per status)...")
-    billing_attempt_nodes = list(appstle.iter_billing_attempts())
-    print(f"  {len(billing_attempt_nodes)} billing attempts")
-
-    print("Building scratch database...")
-    conn = db.build_fresh_db(SCRATCH_DB_PATH)
-
-    order_rows, line_item_rows = load.orders_and_line_items_from_shopify(order_nodes)
-    db.insert_many(conn, "orders", order_rows)
-    db.insert_many(conn, "order_line_items", line_item_rows)
+    order_rows, line_item_rows, removed_count = load.orders_and_line_items_from_shopify(order_nodes)
+    print(f"Filtered out {removed_count} internal test order(s), kept {len(order_rows)}.")
 
     customer_rows = load.customers_from_shopify(customer_nodes)
-    db.insert_many(conn, "customers", customer_rows)
 
-    contract_rows = load.subscription_contracts_from_appstle(contract_nodes)
-    contract_rows = load.enrich_contracts_with_ltv(contract_rows, billing_attempt_nodes)
-    db.insert_many(conn, "subscription_contracts", contract_rows)
+    products = sorted({li["product"] for li in line_item_rows if li["product"] is not None})
+    generated_at = datetime.now(timezone.utc).isoformat()
 
-    billing_attempt_rows = load.billing_attempts_from_appstle(billing_attempt_nodes)
-    db.insert_many(conn, "subscription_billing_attempts", billing_attempt_rows)
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("Computing metrics and exporting JSON...")
-    export_all(conn, EXPORT_DIR)
+    orders_payload = {
+        "generated_at": generated_at,
+        "orders": order_rows,
+        "line_items": line_item_rows,
+    }
+    (EXPORT_DIR / "orders.json").write_text(json.dumps(orders_payload, default=str), encoding="utf-8")
 
-    conn.close()
-    SCRATCH_DB_PATH.unlink(missing_ok=True)
+    customers_payload = {"generated_at": generated_at, "customers": customer_rows}
+    (EXPORT_DIR / "customers.json").write_text(json.dumps(customers_payload, default=str), encoding="utf-8")
+
+    meta_payload = {"generated_at": generated_at, "products": products}
+    (EXPORT_DIR / "meta.json").write_text(json.dumps(meta_payload, indent=2), encoding="utf-8")
 
     elapsed = time.monotonic() - started
+    print(f"Exported orders.json ({len(order_rows)} orders), customers.json ({len(customer_rows)} customers).")
+    print(f"Products found: {products}")
     print(f"Done in {elapsed:.1f}s")
 
 

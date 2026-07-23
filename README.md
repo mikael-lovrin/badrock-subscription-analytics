@@ -37,7 +37,7 @@ would stay the same, just fed from a different, more accurate source.
 
 ## How it stays up to date
 
-A GitHub Actions workflow (`.github/workflows/refresh-and-deploy.yml`) runs
+A GitHub Actions workflow (`.github/workflows/deploy.yml`) runs
 every hour: pulls fresh orders/customers from Shopify, cleans them, and
 redeploys the static site to GitHub Pages. Each run is a full, stateless
 refresh — nothing persists between runs (see the design note at the top of

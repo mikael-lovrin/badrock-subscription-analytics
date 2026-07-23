@@ -1,0 +1,11 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html {
+  font-family: theme("fontFamily.sans");
+}
+
+body {
+  @apply bg-gray-50 text-gray-900 antialiased;
+}

@@ -1,0 +1,7 @@
+.env
+etl/.scratch.db
+site/node_modules/
+site/dist/
+site/public/data/*.json
+__pycache__/
+*.pyc

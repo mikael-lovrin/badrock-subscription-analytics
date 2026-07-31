@@ -10,6 +10,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import { AppstleEarlyChurnCohort } from "../components/AppstleEarlyChurnCohort";
 import { Card } from "../components/Card";
 import { CohortHeatmap } from "../components/CohortHeatmap";
 import { DataBoundary } from "../components/DataBoundary";
@@ -19,7 +20,7 @@ import { useFilters } from "../lib/FilterContext";
 import { formatCurrency, formatNumber, formatPercent, formatPlanLabel } from "../lib/format";
 import {
   buildContracts,
-  computeAppstleEarlyChurn,
+  computeAppstleEarlyChurnCohort,
   computeAvgLifespan,
   computeChurnByCycle,
   computeLtv,
@@ -39,7 +40,10 @@ function SubscriptionsContent({ data }: { data: RawData }) {
     () => buildContracts(data.orders, data.lineItems, selectedProducts),
     [data.orders, data.lineItems, selectedProducts],
   );
-  const appstleEarlyChurn = useMemo(() => computeAppstleEarlyChurn(data.appstleSubscriptions), [data.appstleSubscriptions]);
+  const appstleEarlyChurnCohort = useMemo(
+    () => computeAppstleEarlyChurnCohort(data.appstleSubscriptions),
+    [data.appstleSubscriptions],
+  );
   const mrr = useMemo(() => computeMrr(contracts), [contracts]);
   const churnByCycle = useMemo(() => computeChurnByCycle(contracts, dateRange), [contracts, dateRange]);
   const monthlyChurn = useMemo(() => computeMonthlyChurn(contracts, dateRange), [contracts, dateRange]);
@@ -201,30 +205,7 @@ function SubscriptionsContent({ data }: { data: RawData }) {
         }
         className="mt-6"
       >
-        {appstleEarlyChurn.length === 0 ? (
-          <p className="text-sm text-gray-400">No Appstle data loaded.</p>
-        ) : (
-          <table className="min-w-full text-sm">
-            <thead>
-              <tr className="border-b border-gray-200 text-left text-xs font-medium uppercase text-gray-500">
-                <th className="py-2">Plan</th>
-                <th className="py-2 text-right">Total subscriptions (Appstle)</th>
-                <th className="py-2 text-right">Cancelled before 1st renewal</th>
-                <th className="py-2 text-right">% of total</th>
-              </tr>
-            </thead>
-            <tbody>
-              {appstleEarlyChurn.map((row) => (
-                <tr key={row.plan} className="border-b border-gray-100">
-                  <td className="py-2 font-medium text-gray-900">{formatPlanLabel(row.plan)}</td>
-                  <td className="py-2 text-right">{formatNumber(row.totalSubscriptions)}</td>
-                  <td className="py-2 text-right">{formatNumber(row.cancelledBeforeFirstRenewal)}</td>
-                  <td className="py-2 text-right">{formatPercent(row.pctOfTotal)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
+        <AppstleEarlyChurnCohort rows={appstleEarlyChurnCohort} />
       </Card>
     </div>
   );

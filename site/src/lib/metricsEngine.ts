@@ -775,6 +775,44 @@ export function computeAppstleEarlyChurn(appstleSubs: RawAppstleSubscription[]):
     });
 }
 
+export interface AppstleEarlyChurnCohortRow {
+  cohortMonth: string;
+  plan: string;
+  cohortSize: number;
+  cancelledBeforeFirstRenewal: number;
+  pctCancelledBeforeFirstRenewal: number;
+}
+
+/** Same early-churn signal as computeAppstleEarlyChurn, but broken out by
+ * acquisition month per plan instead of one flat lifetime total — a flat
+ * total hides whether early cancellation is getting better/worse over
+ * time, and pools cohorts that haven't had equal time to show the signal
+ * yet the same way the Shopify-based cohort retention triangle does. */
+export function computeAppstleEarlyChurnCohort(appstleSubs: RawAppstleSubscription[]): AppstleEarlyChurnCohortRow[] {
+  const groups = new Map<string, RawAppstleSubscription[]>();
+  for (const sub of appstleSubs) {
+    if (!sub.created_at) continue;
+    const label = sub.interval_months !== null ? MONTHS_TO_LABEL[sub.interval_months] ?? `${sub.interval_months}x monthly` : "unknown";
+    const key = `${sub.created_at.slice(0, 7)}::${label}`;
+    const arr = groups.get(key) ?? [];
+    arr.push(sub);
+    groups.set(key, arr);
+  }
+  const rows: AppstleEarlyChurnCohortRow[] = [];
+  for (const [key, subs] of [...groups.entries()].sort()) {
+    const [cohortMonth, plan] = key.split("::");
+    const cancelledBeforeFirstRenewal = subs.filter((s) => s.status === "cancelled" && (s.cycles === null || s.cycles <= 1)).length;
+    rows.push({
+      cohortMonth,
+      plan,
+      cohortSize: subs.length,
+      cancelledBeforeFirstRenewal,
+      pctCancelledBeforeFirstRenewal: subs.length ? round2((100 * cancelledBeforeFirstRenewal) / subs.length) : 0,
+    });
+  }
+  return rows;
+}
+
 // ---------------------------------------------------------------------------
 // small helpers
 // ---------------------------------------------------------------------------

@@ -10,7 +10,7 @@
  */
 import type { DateRange } from "./FilterContext";
 import { enumerateDays, toDateOnly } from "./dateUtils";
-import type { RawLineItem, RawOrder } from "./rawTypes";
+import type { RawAppstleSubscription, RawLineItem, RawOrder } from "./rawTypes";
 
 export interface Filters {
   products: Set<string> | null; // null = all products
@@ -281,8 +281,10 @@ function planFromLineItem(li: RawLineItem): { months: number; label: string } | 
 
 // How much longer than one full billing interval a subscriber can go
 // without a new order before we presume they've cancelled, rather than
-// just being mid-retry on a failed payment.
-const CHURN_GRACE_MULTIPLIER = 1.5;
+// just being mid-retry on a failed payment. 1.1x (not more) — confirmed
+// 2026-07-30: a wider grace window was leaving recently-cancelled
+// subscribers misclassified as ACTIVE for too long, understating churn.
+const CHURN_GRACE_MULTIPLIER = 1.1;
 const AVG_DAYS_PER_MONTH = 30.44;
 
 interface SubscriptionEvent {
@@ -294,7 +296,20 @@ interface SubscriptionEvent {
    * this event (see buildContracts) — e.g. an AfterSell upsell add-on.
    * Counts toward lifetimeValue but not toward the plan/MRR price. */
   extraRevenue: number;
+  /** The order's Shopify displayFinancialStatus (PAID/REFUNDED/PARTIALLY_REFUNDED/...) at export time. */
+  financialStatus: string;
+  /** Resolved product for THIS event specifically — a contract's product
+   * can change across events (see buildContracts' customer-level
+   * grouping), so this isn't always the same as the contract's current
+   * Contract.product. */
+  product: string;
+  /** Appstle's own appstle_subscription_first_order tag on this event's
+   * order — the authoritative signal for "this starts a brand-new
+   * subscription", used to split a customer's events into contracts. */
+  isAppstleFirstOrder: boolean;
 }
+
+const REFUNDED_STATUSES = new Set(["REFUNDED", "PARTIALLY_REFUNDED"]);
 
 export interface Contract {
   contractId: string;
@@ -317,19 +332,55 @@ export interface Contract {
    * purchase — see the 2026-07-23 conversation that clarified this.
    */
   renewalsReached: number;
+  /**
+   * Whether the LAST order on this contract — the one after which the
+   * subscriber went silent — came back REFUNDED or PARTIALLY_REFUNDED.
+   * Distinguishes an explicit "I want my money back" cancellation from
+   * plain renewal silence (the subscriber just stopped ordering). An
+   * order refunded earlier in the contract's history, while the
+   * subscriber kept renewing afterward, doesn't count here — it isn't
+   * why they eventually stopped.
+   */
+  lastOrderRefunded: boolean;
 }
 
 /**
- * Groups subscription-tagged, non-upsell line items into a Contract per
- * (customer, product), using Appstle's own order tags
- * (appstle_subscription_first_order / appstle_subscription_recurring_order)
- * as the primary signal for "this order belongs to a subscription", with
- * the [R] product-title tag as a fallback for orders that predate or
- * otherwise lack Appstle's tagging. Always built from the FULL order
- * history regardless of the date-range filter — cycle counts and
- * active/cancelled status would be wrong if earlier orders were excluded;
- * date-range filtering is applied afterward, per-metric, against
- * `createdAt` (cohort membership), not by truncating the event list.
+ * Groups subscription-tagged, non-upsell line items into Contracts, one
+ * per continuous subscription lifecycle. Grouped by CUSTOMER first, then
+ * split into one or more contracts using Appstle's own
+ * appstle_subscription_first_order tag as the authoritative signal for
+ * "this order starts a brand-new subscription" — every other tagged order
+ * for that customer attaches to whichever contract is currently open.
+ *
+ * Deliberately NOT grouped by (customer, product): a contract's product
+ * can change mid-subscription — a format swap, or just a Shopify product
+ * rename — and title-based product resolution has no way to know that's
+ * still the same subscription. Confirmed 2026-07-30: a mis-mapped title
+ * alias made "BadRock - [R]" resolve to a product name that doesn't even
+ * exist in the live catalog, which made 5 real renewals look like 5
+ * brand-new subscriptions the moment that title showed up — and even
+ * after fixing that one alias, the underlying fragility remains: ANY
+ * future rename would silently fracture contract continuity again if
+ * product identity were still the grouping key. Trusting Appstle's own
+ * first/recurring tag instead is immune to that class of bug — it doesn't
+ * care what the product happens to be called this week.
+ *
+ * Trade-off: this assumes a customer doesn't run two genuinely concurrent,
+ * unrelated Appstle subscriptions at once (e.g. Bedroom Bundle AND Beef
+ * Organs in parallel) — if that happens, an order missing its
+ * first-order tag could get attached to the wrong open contract. No
+ * evidence of that pattern in Badrock's order history as of 2026-07-30
+ * (one active subscription per customer is the norm); revisit if that
+ * changes.
+ *
+ * Always built from the FULL order history regardless of the date-range
+ * filter — cycle counts and active/cancelled status would be wrong if
+ * earlier orders were excluded; date-range filtering is applied
+ * afterward, per-metric, against `createdAt` (cohort membership). The
+ * product filter is likewise applied AFTER contracts are built, against
+ * each contract's *current* (most recent) product — filtering candidate
+ * line items beforehand would silently truncate a contract's event
+ * history mid-way if it ever swapped away from the filtered product.
  *
  * `li.is_upsell` line items (variant-level [U1], e.g. a "Unlock - [R]"
  * product's "1 Bundle [U1]" or "1 Sleep Rest [U1]" AfterSell add-on
@@ -349,7 +400,6 @@ export function buildContracts(orders: RawOrder[], lineItems: RawLineItem[], pro
   const eventsByOrderProduct = new Map<string, { order: RawOrder; candidates: RawLineItem[] }>();
   for (const li of lineItems) {
     if (!li.is_subscription || li.is_upsell || li.product === null) continue;
-    if (!matchesProducts(li.product, products)) continue;
     const order = orderById.get(li.order_id);
     if (!order || order.financial_status === "VOIDED" || !order.customer_id) continue;
     const key = `${order.id}::${li.product}`;
@@ -358,7 +408,7 @@ export function buildContracts(orders: RawOrder[], lineItems: RawLineItem[], pro
     eventsByOrderProduct.set(key, bucket);
   }
 
-  const groups = new Map<string, { customerId: string; email: string | null; product: string; events: SubscriptionEvent[] }>();
+  const eventsByCustomer = new Map<string, { email: string | null; events: SubscriptionEvent[] }>();
   for (const { order, candidates } of eventsByOrderProduct.values()) {
     const resolvedLine = candidates.find((li) => planFromLineItem(li) !== null);
     const chosen = resolvedLine ?? candidates.reduce((max, li) => (li.price > max.price ? li : max));
@@ -366,51 +416,70 @@ export function buildContracts(orders: RawOrder[], lineItems: RawLineItem[], pro
       .filter((li) => li !== chosen)
       .reduce((sum, li) => sum + li.price * li.quantity, 0);
 
-    const product = chosen.product as string;
-    const key = `${order.customer_id}::${product}`;
-    const group = groups.get(key) ?? { customerId: order.customer_id as string, email: order.email, product, events: [] };
-    group.events.push({
+    const customerId = order.customer_id as string;
+    const bucket = eventsByCustomer.get(customerId) ?? { email: order.email, events: [] };
+    bucket.events.push({
       date: order.created_at,
       price: chosen.price,
       quantity: chosen.quantity,
       plan: planFromLineItem(chosen),
       extraRevenue: otherLinesRevenue,
+      financialStatus: order.financial_status,
+      product: chosen.product as string,
+      isAppstleFirstOrder: order.is_appstle_first_order,
     });
-    groups.set(key, group);
+    eventsByCustomer.set(customerId, bucket);
   }
 
   const now = new Date();
   const contracts: Contract[] = [];
 
-  for (const [key, group] of groups) {
-    group.events.sort((a, b) => (a.date < b.date ? -1 : 1));
-    const last = group.events[group.events.length - 1];
-    const intervalMonths = last.plan?.months ?? null;
-    const graceMonths = (intervalMonths ?? 1) * CHURN_GRACE_MULTIPLIER;
-    const lastEventAt = new Date(last.date);
-    const daysSinceLast = (now.getTime() - lastEventAt.getTime()) / 86_400_000;
-    const isActive = daysSinceLast <= graceMonths * AVG_DAYS_PER_MONTH;
-    const expectedNextBilling = new Date(lastEventAt.getTime() + (intervalMonths ?? 1) * AVG_DAYS_PER_MONTH * 86_400_000);
+  for (const [customerId, { email, events }] of eventsByCustomer) {
+    events.sort((a, b) => (a.date < b.date ? -1 : 1));
 
-    contracts.push({
-      contractId: key,
-      customerId: group.customerId,
-      customerEmail: group.email,
-      product: group.product,
-      planLabel: last.plan?.label ?? "unknown",
-      intervalMonths,
-      createdAt: group.events[0].date,
-      events: group.events,
-      status: isActive ? "ACTIVE" : "CANCELLED",
-      cancelledOn: isActive ? null : expectedNextBilling.toISOString(),
-      lifetimeValue: round2(
-        group.events.reduce((sum, e) => sum + e.price * e.quantity + e.extraRevenue, 0),
-      ),
-      renewalsReached: group.events.length - 1,
+    // Split this customer's chronological events into one or more
+    // contracts: a first-order-tagged event always starts a new one;
+    // everything else continues whichever contract is currently open.
+    const customerContracts: SubscriptionEvent[][] = [];
+    let current: SubscriptionEvent[] | null = null;
+    for (const event of events) {
+      if (event.isAppstleFirstOrder || current === null) {
+        current = [];
+        customerContracts.push(current);
+      }
+      current.push(event);
+    }
+
+    customerContracts.forEach((contractEvents, idx) => {
+      const last = contractEvents[contractEvents.length - 1];
+      const intervalMonths = last.plan?.months ?? null;
+      const graceMonths = (intervalMonths ?? 1) * CHURN_GRACE_MULTIPLIER;
+      const lastEventAt = new Date(last.date);
+      const daysSinceLast = (now.getTime() - lastEventAt.getTime()) / 86_400_000;
+      const isActive = daysSinceLast <= graceMonths * AVG_DAYS_PER_MONTH;
+      const expectedNextBilling = new Date(lastEventAt.getTime() + (intervalMonths ?? 1) * AVG_DAYS_PER_MONTH * 86_400_000);
+
+      contracts.push({
+        contractId: `${customerId}::${idx}::${contractEvents[0].product}`,
+        customerId,
+        customerEmail: email,
+        product: last.product,
+        planLabel: last.plan?.label ?? "unknown",
+        intervalMonths,
+        createdAt: contractEvents[0].date,
+        events: contractEvents,
+        status: isActive ? "ACTIVE" : "CANCELLED",
+        cancelledOn: isActive ? null : expectedNextBilling.toISOString(),
+        lifetimeValue: round2(
+          contractEvents.reduce((sum, e) => sum + e.price * e.quantity + e.extraRevenue, 0),
+        ),
+        renewalsReached: contractEvents.length - 1,
+        lastOrderRefunded: REFUNDED_STATUSES.has(last.financialStatus),
+      });
     });
   }
 
-  return contracts;
+  return contracts.filter((c) => matchesProducts(c.product, products));
 }
 
 function contractsInCohortRange(contracts: Contract[], range: DateRange): Contract[] {
@@ -511,6 +580,19 @@ export interface CohortRetentionRow {
   plan: string;
   cohortSize: number;
   retentionByCyclePct: Record<number, number>;
+  /**
+   * How many of the cohort have a *resolved* outcome for that cycle —
+   * either they reached it, or they're CANCELLED having stalled before
+   * reaching it. The denominator behind retentionByCyclePct. Deliberately
+   * excludes contracts that are still ACTIVE with renewalsReached < cycle:
+   * their renewal date for that cycle hasn't come up yet, so they're
+   * neither a retention nor a churn data point — including them in the
+   * denominator is what used to make a fresh cohort read as mostly
+   * churned when really most of it just hadn't had a chance to renew yet.
+   */
+  maturedByCycle: Record<number, number>;
+  /** Numerator behind retentionByCyclePct — exposed so the UI can show the exact "reached/matured" fraction instead of just the rounded %. */
+  reachedByCycle: Record<number, number>;
 }
 
 export function computeCohortRetention(contracts: Contract[], dateRange: DateRange, maxCycle = 12): CohortRetentionRow[] {
@@ -526,12 +608,18 @@ export function computeCohortRetention(contracts: Contract[], dateRange: DateRan
   for (const [key, group] of [...groups.entries()].sort()) {
     const [cohortMonth, plan] = key.split("::");
     const retentionByCyclePct: Record<number, number> = {};
+    const maturedByCycle: Record<number, number> = {};
+    const reachedByCycle: Record<number, number> = {};
     for (let cycle = 1; cycle <= maxCycle; cycle++) {
       const reached = group.filter((c) => c.renewalsReached >= cycle).length;
       if (reached === 0) break;
-      retentionByCyclePct[cycle] = round2((100 * reached) / group.length);
+      const churnedBeforeReaching = group.filter((c) => c.status === "CANCELLED" && c.renewalsReached < cycle).length;
+      const matured = reached + churnedBeforeReaching;
+      maturedByCycle[cycle] = matured;
+      reachedByCycle[cycle] = reached;
+      retentionByCyclePct[cycle] = round2((100 * reached) / matured);
     }
-    rows.push({ cohortMonth, plan, cohortSize: group.length, retentionByCyclePct });
+    rows.push({ cohortMonth, plan, cohortSize: group.length, retentionByCyclePct, maturedByCycle, reachedByCycle });
   }
   return rows;
 }
@@ -583,7 +671,22 @@ export interface PlanMixRow {
   totalSubscribers: number;
   activeSubscribers: number;
   cancelledSubscribers: number;
+  /**
+   * Subscribers still on their very first billing cycle (never renewed)
+   * and not yet past their grace deadline for it — too new to have had a
+   * chance to prove out either way. Excluded from cancellationRatePct's
+   * denominator for the same reason immature cohorts are excluded from
+   * computeCohortRetention: mixing them in makes the rate float purely
+   * with how many people signed up recently, not with actual churn.
+   */
+  pendingSubscribers: number;
   cancellationRatePct: number;
+  /** Of cancelledSubscribers: their last order came back refunded (explicit
+   * "give me my money back"), vs. they just stopped ordering and let the
+   * subscription lapse silently. See Contract.lastOrderRefunded. */
+  cancelledRefunded: number;
+  cancelledSilent: number;
+  refundShareOfCancelledPct: number;
   avgLtv: number | null;
 }
 
@@ -600,14 +703,74 @@ export function computePlanMix(contracts: Contract[], dateRange: DateRange): Pla
     .map(([plan, group]) => {
       const active = group.filter((c) => c.status === "ACTIVE").length;
       const cancelled = group.filter((c) => c.status === "CANCELLED").length;
+      // Matured = has a resolved outcome for "did it ever renew at least
+      // once": either it already cancelled (always resolved, status only
+      // flips once its grace deadline has passed), or it renewed at least
+      // once already. Still-ACTIVE, still-on-cycle-0 contracts are the
+      // only "pending" ones — they haven't had their first chance yet.
+      const matured = group.filter((c) => c.status === "CANCELLED" || c.renewalsReached >= 1).length;
+      const pending = group.length - matured;
+      const cancelledContracts = group.filter((c) => c.status === "CANCELLED");
+      const cancelledRefunded = cancelledContracts.filter((c) => c.lastOrderRefunded).length;
+      const cancelledSilent = cancelledContracts.length - cancelledRefunded;
       const ltvValues = group.map((c) => c.lifetimeValue);
       return {
         plan,
         totalSubscribers: group.length,
         activeSubscribers: active,
         cancelledSubscribers: cancelled,
-        cancellationRatePct: group.length ? round2((100 * cancelled) / group.length) : 0,
+        pendingSubscribers: pending,
+        cancellationRatePct: matured ? round2((100 * cancelled) / matured) : 0,
+        cancelledRefunded,
+        cancelledSilent,
+        refundShareOfCancelledPct: cancelled ? round2((100 * cancelledRefunded) / cancelled) : 0,
         avgLtv: ltvValues.length ? round2(avg(ltvValues)) : null,
+      };
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Appstle cross-check (separate from buildContracts on purpose — see
+// 2026-07-31 decision: now that read_all_orders gives full Shopify
+// history, buildContracts went back to pure Shopify-order-silence
+// inference. Real Appstle status doesn't get blended into contracts
+// anymore; it's reported standalone instead, since it's the only source
+// that can see a subscriber who cancelled proactively without ever
+// missing an order — Shopify history has zero trace of that regardless
+// of how much history is available.
+// ---------------------------------------------------------------------------
+
+export interface AppstleEarlyChurnRow {
+  plan: string;
+  totalSubscriptions: number;
+  /** Cancelled with 1 or 0 completed billing cycles — i.e. cancelled
+   * before ever reaching their first renewal. */
+  cancelledBeforeFirstRenewal: number;
+  pctOfTotal: number;
+}
+
+/** Per-plan breakdown of real Appstle cancellations that happened before
+ * the subscriber ever reached their first renewal — the number the
+ * Shopify-inference model structurally cannot produce, since a
+ * subscriber who cancels without any accompanying order leaves nothing
+ * in order history to infer from. */
+export function computeAppstleEarlyChurn(appstleSubs: RawAppstleSubscription[]): AppstleEarlyChurnRow[] {
+  const byPlan = new Map<string, RawAppstleSubscription[]>();
+  for (const sub of appstleSubs) {
+    const label = sub.interval_months !== null ? MONTHS_TO_LABEL[sub.interval_months] ?? `${sub.interval_months}x monthly` : "unknown";
+    const arr = byPlan.get(label) ?? [];
+    arr.push(sub);
+    byPlan.set(label, arr);
+  }
+  return [...byPlan.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([plan, subs]) => {
+      const cancelledBeforeFirstRenewal = subs.filter((s) => s.status === "cancelled" && (s.cycles === null || s.cycles <= 1)).length;
+      return {
+        plan,
+        totalSubscriptions: subs.length,
+        cancelledBeforeFirstRenewal,
+        pctOfTotal: subs.length ? round2((100 * cancelledBeforeFirstRenewal) / subs.length) : 0,
       };
     });
 }

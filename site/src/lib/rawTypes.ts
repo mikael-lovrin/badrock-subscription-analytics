@@ -68,3 +68,41 @@ export interface MetaPayload {
   generated_at: string;
   products: string[];
 }
+
+/** A row from a manually-exported Appstle subscription CSV (see
+ * etl/appstle_csv.py) — real subscription ledger data, not inferred from
+ * order silence. `status` is Appstle's own lowercase string (observed:
+ * "active", "cancelled" — "paused" is a plausible third value per the
+ * export's Pause columns, not yet seen in a real export). */
+export interface RawAppstleSubscription {
+  id: string;
+  customer_email: string;
+  status: string;
+  product: string | null;
+  created_at: string | null;
+  next_order_date: string | null;
+  interval_months: number | null;
+  cancellation_date: string | null;
+  cancellation_reason: string | null;
+  cancellation_note: string | null;
+  paused_on_date: string | null;
+  cycles: number | null;
+  total_revenue: number;
+  first_order_name: string | null;
+  last_order_name: string | null;
+  last_order_date: string | null;
+}
+
+export interface AppstleSubscriptionsPayload {
+  /** When THIS ETL run happened — not when the Appstle data itself was captured, see captured_at. */
+  generated_at: string;
+  /** When the underlying CSV was actually parsed — the freshest of either
+   * a local run right after a new export, or whenever the committed
+   * snapshot was last regenerated (see etl/appstle_csv.py). null if no
+   * Appstle data has ever been available at all. */
+  captured_at: string | null;
+  /** Filename of the CSV this was parsed from, or null if no manual
+   * export has ever been dropped in etl/manual-exports/. */
+  source_file: string | null;
+  subscriptions: RawAppstleSubscription[];
+}

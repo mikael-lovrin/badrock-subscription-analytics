@@ -86,9 +86,15 @@ _PRODUCT_ALIASES: dict[str, str] = {
     # anything after the [TAG].
     "BadRock Bundle": "Bedroom Bundle",
     "Unlock": "Bedroom Bundle",
-    # Strips format — the bare "BadRock" title (no suffix) is what's now
-    # branded as Bedroom Stripes.
-    "BadRock": "Bedroom Stripes",
+    # The bare "BadRock" title (no suffix) is Bedroom Bundle, not Bedroom
+    # Stripes — corrected 2026-07-30 per Mikael; the earlier mapping here
+    # was wrong and had been silently splitting a chunk of Bundle
+    # subscribers' renewals into a phantom "Bedroom Stripes" contract
+    # every time an order happened to use this exact title, breaking
+    # their renewal-cycle continuity (see the "false churn from a product
+    # swap" investigation in chat, 2026-07-30 — turned out not to be a
+    # swap at all, just this mis-mapped title).
+    "BadRock": "Bedroom Bundle",
     # Beef Organ Complex naming drift across test phases + shorthand.
     "BadRock - BOC": "Beef Organs",
     "BadRock - Beef Organ Complex": "Beef Organs",

@@ -6,6 +6,13 @@ name: Refresh data and deploy
 # site/src/lib/metricsEngine.ts) before deploying to GitHub Pages. Nothing
 # is committed back to the repo — the JSON is only a build input (see
 # etl/run.py's "stateless, full-refresh" design note).
+#
+# Appstle subscription status (etl/appstle_csv.py) is the one exception to
+# "fully automated": the raw CSV Mikael exports by hand never reaches this
+# checkout (gitignored, has PII the site never otherwise exposes) — this
+# workflow only ever sees whichever small, PII-trimmed etl/appstle_snapshot.json
+# was last committed. Re-run the ETL locally with a fresh CSV and commit
+# the refreshed snapshot to update what this workflow uses.
 on:
   schedule:
     - cron: "0 * * * *"

@@ -6,3 +6,8 @@ site/public/data/*.json
 site/*.tsbuildinfo
 __pycache__/
 *.pyc
+
+# Manually-exported Appstle CSVs carry full customer PII (phone, address,
+# payment brand/last4/expiry) that the site's JSON exports deliberately
+# never include — never let these reach git history.
+etl/manual-exports/*.csv

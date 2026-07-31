@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { CustomersPayload, MetaPayload, OrdersPayload } from "./rawTypes";
+import type { AppstleSubscriptionsPayload, CustomersPayload, MetaPayload, OrdersPayload, RawAppstleSubscription } from "./rawTypes";
 
 export interface RawData {
   generatedAt: string;
@@ -7,6 +7,15 @@ export interface RawData {
   lineItems: OrdersPayload["line_items"];
   customers: CustomersPayload["customers"];
   products: string[];
+  appstleSubscriptions: RawAppstleSubscription[];
+  /** Filename of the Appstle CSV the ETL last parsed, or null if none has
+   * ever been dropped in etl/manual-exports/ — surfaced in the UI so it's
+   * obvious how stale (or absent) the real-status cross-check is. */
+  appstleSourceFile: string | null;
+  /** When the Appstle data was actually captured — can lag well behind
+   * generatedAt, since it only refreshes when Mikael reruns the ETL
+   * locally with a fresh CSV (see etl/appstle_csv.py). */
+  appstleCapturedAt: string | null;
 }
 
 type RawDataState = { status: "loading" } | { status: "error"; error: string } | { status: "ready"; data: RawData };
@@ -33,8 +42,14 @@ export function useRawData(): RawDataState {
       fetchJson<OrdersPayload>("orders.json"),
       fetchJson<CustomersPayload>("customers.json"),
       fetchJson<MetaPayload>("meta.json"),
+      // Tolerate this one missing entirely (older deployments, or a brand
+      // that's never had an Appstle CSV dropped in) rather than failing
+      // the whole page — Shopify-only inference still works without it.
+      fetchJson<AppstleSubscriptionsPayload>("appstle_subscriptions.json").catch(
+        () => ({ generated_at: "", captured_at: null, source_file: null, subscriptions: [] }) as AppstleSubscriptionsPayload,
+      ),
     ])
-      .then(([ordersPayload, customersPayload, metaPayload]) => {
+      .then(([ordersPayload, customersPayload, metaPayload, appstlePayload]) => {
         setState({
           status: "ready",
           data: {
@@ -43,6 +58,9 @@ export function useRawData(): RawDataState {
             lineItems: ordersPayload.line_items,
             customers: customersPayload.customers,
             products: metaPayload.products,
+            appstleSubscriptions: appstlePayload.subscriptions,
+            appstleSourceFile: appstlePayload.source_file,
+            appstleCapturedAt: appstlePayload.captured_at,
           },
         });
       })

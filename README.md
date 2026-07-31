@@ -7,33 +7,98 @@ product (multi-select) and date range.
 
 ## Data source
 
-**Shopify Admin GraphQL API** is the only external data source — orders,
-customers, line items. Badrock's Appstle Subscriptions plan doesn't
-include External API access (confirmed 2026-07-23; upgrading wasn't worth
-it for this), so subscription lifecycle is reconstructed entirely from
-Shopify order history instead of a real billing ledger:
+Two sources feed the site:
+
+1. **Shopify Admin GraphQL API** (`etl/shopify_client.py`) — orders,
+   customers, line items. Pulled automatically every hour, no manual step.
+2. **A manually-exported Appstle subscription CSV** (`etl/appstle_csv.py`,
+   dropped by hand into `etl/manual-exports/` — see below) — real
+   subscription-ledger status, used to override the Shopify-based
+   inference wherever a row can be matched. Manual because Badrock's
+   Appstle plan doesn't include API access (confirmed 2026-07-23;
+   upgrading wasn't worth it for this).
+
+### ⚠️ Shopify order history is capped at 60 days
+
+Confirmed 2026-07-31: the custom app's Admin API access, without the
+**`read_all_orders`** scope, only returns orders from the **last 60
+days** — a rolling window, so a little more history rolls off every day
+the ETL runs. This was silently truncating cohort history and making
+plenty of real renewals look like "no prior order exists for this
+customer" (see the chat investigation around this date — order #1056,
+for example, was invisible to every pull even though it's a completely
+normal fulfilled order, just 63+ days old).
+
+**Fix**: Shopify Admin → Settings → Apps and sales channels → **Develop
+apps** → this app → Configuration → Admin API scopes → enable
+`read_all_orders`. This is self-serve for a custom app installed on your
+own store (no Shopify review needed, unlike a public/listed app). Do this
+and re-run the ETL before trusting any cohort further back than ~2
+months, or before assuming a "single order, no renewal history" contract
+is a genuine data gap rather than just this cap.
+
+### Subscription lifecycle reconstruction (Shopify-only fallback)
+
+Wherever no matching Appstle CSV row exists, subscription lifecycle is
+reconstructed from Shopify order history instead of a real billing
+ledger:
 
 - Appstle tags every order it creates with `appstle_subscription_first_order`
-  or `appstle_subscription_recurring_order` — that's the primary signal
-  used to tell a subscriber's first order from a renewal.
+  or `appstle_subscription_recurring_order` — the authoritative signal
+  for "this order starts a brand-new subscription" vs. "this continues
+  the customer's currently-open one" (see `buildContracts()`'s
+  customer-level grouping in `site/src/lib/metricsEngine.ts` — contracts
+  are grouped by customer, not by (customer, product), specifically so a
+  product rename or format swap mid-subscription can't fracture cycle
+  continuity the way it did before 2026-07-31).
 - A subscriber's renewal **cycle number** = how many of those tagged orders
-  they've placed, in date order, for a given (customer, product) pair.
-  Cycle 1 = their **first renewal** (2nd order), not their initial
-  purchase — see the convention agreed with Mikael on 2026-07-23.
+  they've placed, in date order. Cycle 1 = their **first renewal** (2nd
+  order), not their initial purchase — see the convention agreed with
+  Mikael on 2026-07-23.
 - **Status (ACTIVE/CANCELLED) is inferred, not observed**: a subscriber
-  counts as ACTIVE if a new order arrived within 1.5× their billing
+  counts as ACTIVE if a new order arrived within 1.1× their billing
   interval, otherwise CANCELLED as of their expected next billing date.
-  There's no real cancellation event behind that — see the caveat banner
-  on the site's Subscriptions page, and `buildContracts()` in
-  `site/src/lib/metricsEngine.ts`.
+  Confirmed 2026-07-31 against a real Appstle export that this
+  undercounts real cancellations substantially — plenty of subscribers
+  cancel proactively, days before this heuristic would ever catch it.
+  Prefer the Appstle CSV path (above) wherever possible; this is a
+  fallback, not the primary source, despite being the only one that
+  works without any manual step.
 - Internal test orders (known staff emails/domains, `teste`/`test` in the
   name, or suspiciously low totals like $0/$1/$5) are filtered out before
-  anything else — see `etl/load.py`'s `is_test_order()`.
+  anything else — see `etl/load.py`'s `is_test_order()`, reused as-is by
+  `etl/appstle_csv.py` for the CSV path.
 
-If Badrock's Appstle plan is ever upgraded to include API access, this
-whole approximation can be replaced with real billing-ledger data — the
-site's metric definitions (MRR, churn-by-cycle, cohort retention, LTV)
-would stay the same, just fed from a different, more accurate source.
+If Badrock's Appstle plan is ever upgraded to include full API access,
+this whole Shopify-inference fallback can be retired in favor of always
+pulling the real ledger — the site's metric definitions (MRR,
+churn-by-cycle, cohort retention, LTV) would stay the same, just fed from
+a more accurate source for every contract instead of only the ones that
+happen to match a manual CSV export.
+
+### Appstle CSV (manual)
+
+1. Appstle dashboard → Subscriptions → Export → download the CSV.
+2. Drop it into `etl/manual-exports/` (any filename Appstle gives it is
+   fine — `find_latest_export()` in `etl/appstle_csv.py` picks the most
+   recent by filename automatically). **Never commit this file** — it
+   carries full customer PII (phone, address, payment brand/last 4/expiry)
+   that the site's JSON exports deliberately never include; it's
+   gitignored (`etl/manual-exports/*.csv`) as a backstop, but don't rely
+   on that alone.
+3. Run the ETL locally (`python etl/run.py`, from the `etl/` directory).
+   This parses the fresh CSV **and** overwrites `etl/appstle_snapshot.json`
+   — a small, PII-trimmed (email + status + dates only, no phone/address/
+   payment) cross-check that's safe to commit.
+4. **Commit and push `etl/appstle_snapshot.json`.** This step matters:
+   the raw CSV never leaves your machine (gitignored, invisible to CI), so
+   the hourly GitHub Actions run only ever sees whatever snapshot was last
+   committed here — skip this and the deployed site keeps using a stale
+   (or absent) Appstle cross-check indefinitely, even though Shopify data
+   keeps refreshing hourly as normal.
+5. Repeat periodically (weekly/monthly) to keep the cross-check fresh —
+   there's no way to automate the export itself without Appstle API
+   access.
 
 ## How it stays up to date
 
@@ -132,8 +197,15 @@ from `buildContracts()`, which groups Appstle-tagged order line items by
 - **Monthly churn** — calendar-month cancellations divided by subscribers
   active at the start of that month. Distinct from churn-by-cycle: this is
   churn on the calendar, not per renewal.
-- **Cohort retention** — contracts grouped by acquisition month × plan,
-  reporting what % of that cohort reached each renewal cycle.
+- **Cohort retention** — contracts grouped by acquisition month × plan (one
+  triangle per plan on the site, cadences aren't comparable pooled),
+  reporting what % of that cohort's *resolved* outcomes reached each
+  renewal cycle. Resolved = reached the cycle, or CANCELLED having stalled
+  before reaching it; contracts still ACTIVE with too little elapsed time
+  to have hit that cycle's renewal date are excluded from the denominator
+  (rendered "aguardando" on the heatmap) rather than counted as churn —
+  otherwise a cohort acquired last week reads as mostly-churned just
+  because most of it hasn't had a chance to renew yet.
 - **LTV** — sum of all charges to date per contract, averaged overall and
   by plan. A live snapshot, not a converged number — it will keep rising
   until every contract in a cohort has eventually cancelled.

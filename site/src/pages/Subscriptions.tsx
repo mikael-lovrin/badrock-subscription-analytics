@@ -19,6 +19,7 @@ import { useFilters } from "../lib/FilterContext";
 import { formatCurrency, formatNumber, formatPercent, formatPlanLabel } from "../lib/format";
 import {
   buildContracts,
+  computeAppstleEarlyChurn,
   computeAvgLifespan,
   computeChurnByCycle,
   computeLtv,
@@ -38,6 +39,7 @@ function SubscriptionsContent({ data }: { data: RawData }) {
     () => buildContracts(data.orders, data.lineItems, selectedProducts),
     [data.orders, data.lineItems, selectedProducts],
   );
+  const appstleEarlyChurn = useMemo(() => computeAppstleEarlyChurn(data.appstleSubscriptions), [data.appstleSubscriptions]);
   const mrr = useMemo(() => computeMrr(contracts), [contracts]);
   const churnByCycle = useMemo(() => computeChurnByCycle(contracts, dateRange), [contracts, dateRange]);
   const monthlyChurn = useMemo(() => computeMonthlyChurn(contracts, dateRange), [contracts, dateRange]);
@@ -48,6 +50,7 @@ function SubscriptionsContent({ data }: { data: RawData }) {
 
   const totalSubscribers = planMix.reduce((sum, p) => sum + p.totalSubscribers, 0);
   const totalCancelled = planMix.reduce((sum, p) => sum + p.cancelledSubscribers, 0);
+  const totalMatured = totalSubscribers - planMix.reduce((sum, p) => sum + p.pendingSubscribers, 0);
 
   return (
     <div>
@@ -62,9 +65,10 @@ function SubscriptionsContent({ data }: { data: RawData }) {
         <p className="mt-1">
           Badrock's Appstle plan doesn't include API access, so these numbers are derived from Shopify order history
           instead of a real billing ledger: a subscriber counts as <strong>ACTIVE</strong> if a new order arrived
-          within 1.5× their billing interval, otherwise <strong>CANCELLED</strong> as of their expected next billing
-          date (the date they were due to renew — see the "Date do churn" convention agreed on 2026-07-23). There is
-          no real cancellation event behind that, it's inferred from renewal silence.
+          within 1.1× their billing interval, otherwise <strong>CANCELLED</strong> as of their expected next billing
+          date — inferred from renewal silence, not a real cancellation event. This can't catch a subscriber who
+          cancels proactively without placing (or missing) any order — see the real Appstle cross-check below the
+          plan comparison table for that.
         </p>
       </div>
 
@@ -78,8 +82,8 @@ function SubscriptionsContent({ data }: { data: RawData }) {
         />
         <KpiCard
           label="Cancellation rate"
-          value={formatPercent(totalSubscribers ? (100 * totalCancelled) / totalSubscribers : 0)}
-          hint="Of all subscribers ever acquired"
+          value={formatPercent(totalMatured ? (100 * totalCancelled) / totalMatured : 0)}
+          hint={`Of ${totalMatured} subscribers past their first renewal deadline (${totalSubscribers - totalMatured} too new to count yet)`}
         />
       </div>
 
@@ -125,10 +129,13 @@ function SubscriptionsContent({ data }: { data: RawData }) {
       </div>
 
       <Card title="Cohort retention" subtitle="% of each acquisition-month cohort still renewing at each renewal cycle" className="mb-6">
-        <CohortHeatmap rows={cohortRetention} />
+        <CohortHeatmap rows={cohortRetention} planMix={planMix} />
       </Card>
 
-      <Card title="Plan comparison" subtitle="Monthly ($49) vs bimonthly ($88) vs trimonthly ($117)">
+      <Card
+        title="Plan comparison"
+        subtitle="Monthly ($49) vs bimonthly ($88) vs trimonthly ($117). Cancellation rate is of subscribers past their first renewal deadline — see 'Pending'. Scoped to whoever acquired within the date filter above (top-right) — clear it to see all-time, or set From/To to a specific acquisition window."
+      >
         <table className="min-w-full text-sm">
           <thead>
             <tr className="border-b border-gray-200 text-left text-xs font-medium uppercase text-gray-500">
@@ -136,6 +143,9 @@ function SubscriptionsContent({ data }: { data: RawData }) {
               <th className="py-2 text-right">Total subscribers</th>
               <th className="py-2 text-right">Active</th>
               <th className="py-2 text-right">Cancelled</th>
+              <th className="py-2 text-right">— never renewed</th>
+              <th className="py-2 text-right">— refunded</th>
+              <th className="py-2 text-right">Pending</th>
               <th className="py-2 text-right">Cancellation rate</th>
               <th className="py-2 text-right">Avg LTV</th>
             </tr>
@@ -147,12 +157,74 @@ function SubscriptionsContent({ data }: { data: RawData }) {
                 <td className="py-2 text-right">{formatNumber(row.totalSubscribers)}</td>
                 <td className="py-2 text-right">{formatNumber(row.activeSubscribers)}</td>
                 <td className="py-2 text-right">{formatNumber(row.cancelledSubscribers)}</td>
-                <td className="py-2 text-right">{formatPercent(row.cancellationRatePct)}</td>
+                <td
+                  className="py-2 text-right text-gray-500"
+                  title="Just stopped ordering — no refund on their last order, plain renewal silence"
+                >
+                  {formatNumber(row.cancelledSilent)}
+                </td>
+                <td
+                  className="py-2 text-right text-gray-500"
+                  title="Their last order came back REFUNDED or PARTIALLY_REFUNDED — an explicit ask for money back, not silent non-renewal"
+                >
+                  {row.cancelledSubscribers > 0
+                    ? `${formatNumber(row.cancelledRefunded)} (${formatPercent(row.refundShareOfCancelledPct)})`
+                    : "—"}
+                </td>
+                <td className="py-2 text-right text-gray-400" title="Still on their first cycle, not yet past their renewal deadline">
+                  {formatNumber(row.pendingSubscribers)}
+                </td>
+                <td className="py-2 text-right">
+                  {formatPercent(row.cancellationRatePct)}
+                  {row.totalSubscribers - row.pendingSubscribers < 5 && (
+                    <span
+                      className="ml-1 text-[10px] font-normal text-gray-400"
+                      title={`Only ${row.totalSubscribers - row.pendingSubscribers} subscriber(s) have actually reached their first renewal deadline yet — this rate will swing wildly until that grows. Longer billing intervals (e.g. trimonthly) take longer to have anyone "mature".`}
+                    >
+                      (amostra pequena)
+                    </span>
+                  )}
+                </td>
                 <td className="py-2 text-right">{row.avgLtv !== null ? formatCurrency(row.avgLtv) : "—"}</td>
               </tr>
             ))}
           </tbody>
         </table>
+      </Card>
+
+      <Card
+        title="Appstle — cancelled before first renewal"
+        subtitle={
+          data.appstleSourceFile
+            ? `Real Appstle status, not inferred — from ${data.appstleSourceFile}${data.appstleCapturedAt ? `, captured ${new Date(data.appstleCapturedAt).toLocaleDateString()}` : ""}. The one thing the Shopify-inference model above structurally can't see: a subscriber who cancelled without ever placing (or missing) an order.`
+            : "No Appstle export available yet — drop a CSV in etl/manual-exports/ and re-run the ETL (see README) to populate this."
+        }
+        className="mt-6"
+      >
+        {appstleEarlyChurn.length === 0 ? (
+          <p className="text-sm text-gray-400">No Appstle data loaded.</p>
+        ) : (
+          <table className="min-w-full text-sm">
+            <thead>
+              <tr className="border-b border-gray-200 text-left text-xs font-medium uppercase text-gray-500">
+                <th className="py-2">Plan</th>
+                <th className="py-2 text-right">Total subscriptions (Appstle)</th>
+                <th className="py-2 text-right">Cancelled before 1st renewal</th>
+                <th className="py-2 text-right">% of total</th>
+              </tr>
+            </thead>
+            <tbody>
+              {appstleEarlyChurn.map((row) => (
+                <tr key={row.plan} className="border-b border-gray-100">
+                  <td className="py-2 font-medium text-gray-900">{formatPlanLabel(row.plan)}</td>
+                  <td className="py-2 text-right">{formatNumber(row.totalSubscriptions)}</td>
+                  <td className="py-2 text-right">{formatNumber(row.cancelledBeforeFirstRenewal)}</td>
+                  <td className="py-2 text-right">{formatPercent(row.pctOfTotal)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
       </Card>
     </div>
   );

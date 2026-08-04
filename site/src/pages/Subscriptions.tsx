@@ -208,6 +208,14 @@ function SubscriptionsContent({ data }: { data: RawData }) {
 
       <div className="mb-6 grid grid-cols-1 gap-6 lg:grid-cols-2">
         <Card title="Churn by renewal cycle" subtitle="% of subscribers who cancelled right after reaching each renewal">
+          <p className="mb-3 text-xs text-gray-500">
+            Scoped to subscribers who reached that renewal at least once — a subscriber who cancels{" "}
+            <strong>before ever renewing</strong> never enters this chart at all, no matter which product they were
+            on. That's most of the cancellations right now (91% of all-time cancelled contracts never reached a
+            single renewal), so this chart barely moves when you switch the product filter even though real churn
+            differs a lot by product. For the full picture including day-one cancellations, see{" "}
+            <strong>"Churn: aggregate vs. Bundle-only vs. excluding stockout"</strong> below.
+          </p>
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={churnByCycle}>
               <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />

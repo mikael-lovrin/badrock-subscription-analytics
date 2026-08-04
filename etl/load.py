@@ -105,6 +105,23 @@ _PRODUCT_ALIASES: dict[str, str] = {
     "BadRock - Prime Organs Po": "Prime Organs Powder",
 }
 
+# Products that must never appear in this tool's output at all, regardless
+# of naming drift — added 2026-08-04 per Mikael: Dewlyte is a *different*
+# FEG-group brand (confirmed against Projects/Badrock/CLAUDE.md's product
+# table — Bedroom Bundle, Bedroom Stripes, Beef Organ Complex, NAD+ are the
+# only Badrock products; Dewlyte isn't one of them) that happens to ride
+# the same shared Shopify store / Appstle setup as Badrock. It was being
+# pulled into this Badrock-scoped subscription analytics tool purely
+# because nothing filtered it out — not because it belongs here. Excluded
+# at the ETL level (orders, line items, customers, Appstle subscriptions,
+# Appstle billing events) rather than hidden in the UI, so it never leaks
+# into any exported JSON.
+_EXCLUDED_PRODUCTS: set[str] = {"Dewlyte"}
+
+
+def is_excluded_product(product: str | None) -> bool:
+    return product in _EXCLUDED_PRODUCTS
+
 
 def _shopify_gid_to_id(gid: str) -> str:
     """Shopify GraphQL IDs look like 'gid://shopify/Order/123' — we keep
@@ -181,9 +198,10 @@ def _interval_months_from_variant(variant_title: str | None) -> int | None:
 
 def orders_and_line_items_from_shopify(
     order_nodes: list[dict[str, Any]],
-) -> tuple[list[dict], list[dict], int]:
+) -> tuple[list[dict], list[dict], int, int, set[str]]:
     """
-    Returns (order_rows, line_item_rows, test_orders_removed_count).
+    Returns (order_rows, line_item_rows, test_orders_removed_count,
+    excluded_product_orders_removed_count, excluded_product_customer_emails).
 
     Each order row carries `is_appstle_first_order` / `is_appstle_recurring_order`,
     parsed from the `appstle_subscription_first_order` / `appstle_subscription_recurring_order`
@@ -191,6 +209,11 @@ def orders_and_line_items_from_shopify(
     truth the site's subscription-cycle engine uses to tell a subscriber's
     first order from a renewal (see site/src/lib/metricsEngine.ts), far
     more reliable than guessing from price/title alone.
+
+    `excluded_product_customer_emails` is every distinct order-level email
+    seen on a dropped (Dewlyte) order — callers use this, minus whatever
+    emails remain in the kept order rows, to also drop Dewlyte-only
+    customers from customers.json (see run.py).
     """
     order_rows: list[dict] = []
     line_item_rows: list[dict] = []
@@ -246,7 +269,20 @@ def orders_and_line_items_from_shopify(
                 }
             )
 
-    return order_rows, line_item_rows, removed
+    # Drop any order that touches an excluded product (Dewlyte — see
+    # _EXCLUDED_PRODUCTS above). The whole order is dropped, not just the
+    # offending line item: every order observed so far is single-product,
+    # so this is equivalent in practice to "drop Dewlyte line items" while
+    # also avoiding orphaned zero-line-item order rows in orders.json.
+    excluded_order_ids = {li["order_id"] for li in line_item_rows if is_excluded_product(li["product"])}
+    excluded_order_emails = {
+        (o["email"] or "").strip().lower() for o in order_rows if o["id"] in excluded_order_ids and o.get("email")
+    }
+    if excluded_order_ids:
+        line_item_rows = [li for li in line_item_rows if li["order_id"] not in excluded_order_ids]
+        order_rows = [o for o in order_rows if o["id"] not in excluded_order_ids]
+
+    return order_rows, line_item_rows, removed, len(excluded_order_ids), excluded_order_emails
 
 
 # ---------------------------------------------------------------------------

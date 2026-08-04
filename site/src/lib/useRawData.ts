@@ -1,5 +1,13 @@
 import { useEffect, useState } from "react";
-import type { AppstleSubscriptionsPayload, CustomersPayload, MetaPayload, OrdersPayload, RawAppstleSubscription } from "./rawTypes";
+import type {
+  AppstleBillingEventsPayload,
+  AppstleSubscriptionsPayload,
+  CustomersPayload,
+  MetaPayload,
+  OrdersPayload,
+  RawAppstleBillingEvent,
+  RawAppstleSubscription,
+} from "./rawTypes";
 
 export interface RawData {
   generatedAt: string;
@@ -16,6 +24,11 @@ export interface RawData {
    * generatedAt, since it only refreshes when Mikael reruns the ETL
    * locally with a fresh CSV (see etl/appstle_csv.py). */
   appstleCapturedAt: string | null;
+  /** One row per billing attempt (success/failed/skipped-dunning) — see
+   * rawTypes.RawAppstleBillingEvent. Empty if none of the 3 ANALYTICS_*
+   * exports have ever been dropped in etl/manual-exports/. */
+  appstleBillingEvents: RawAppstleBillingEvent[];
+  appstleBillingEventSources: AppstleBillingEventsPayload["sources"] | null;
 }
 
 type RawDataState = { status: "loading" } | { status: "error"; error: string } | { status: "ready"; data: RawData };
@@ -48,8 +61,20 @@ export function useRawData(): RawDataState {
       fetchJson<AppstleSubscriptionsPayload>("appstle_subscriptions.json").catch(
         () => ({ generated_at: "", captured_at: null, source_file: null, subscriptions: [] }) as AppstleSubscriptionsPayload,
       ),
+      // Same tolerate-missing pattern — a brand/deployment that predates
+      // the 2026-08-04 dunning exports (or never had them dropped in)
+      // just gets an empty funnel instead of a broken page.
+      fetchJson<AppstleBillingEventsPayload>("appstle_billing_events.json").catch(
+        () =>
+          ({
+            generated_at: "",
+            captured_at: null,
+            sources: { success: null, failed: null, skipped_dunning: null },
+            events: [],
+          }) as AppstleBillingEventsPayload,
+      ),
     ])
-      .then(([ordersPayload, customersPayload, metaPayload, appstlePayload]) => {
+      .then(([ordersPayload, customersPayload, metaPayload, appstlePayload, billingEventsPayload]) => {
         setState({
           status: "ready",
           data: {
@@ -61,6 +86,8 @@ export function useRawData(): RawDataState {
             appstleSubscriptions: appstlePayload.subscriptions,
             appstleSourceFile: appstlePayload.source_file,
             appstleCapturedAt: appstlePayload.captured_at,
+            appstleBillingEvents: billingEventsPayload.events,
+            appstleBillingEventSources: billingEventsPayload.sources,
           },
         });
       })

@@ -10,7 +10,7 @@
  */
 import type { DateRange } from "./FilterContext";
 import { enumerateDays, toDateOnly } from "./dateUtils";
-import type { RawAppstleSubscription, RawLineItem, RawOrder } from "./rawTypes";
+import type { RawAppstleBillingEvent, RawAppstleSubscription, RawLineItem, RawOrder } from "./rawTypes";
 
 export interface Filters {
   products: Set<string> | null; // null = all products
@@ -20,6 +20,37 @@ export interface Filters {
 function matchesProducts(product: string | null, products: Set<string> | null): boolean {
   if (products === null || products.size === 0) return true;
   return product !== null && products.has(product);
+}
+
+/**
+ * Applies the global product multi-select to the Appstle real-status
+ * ledger. Confirmed 2026-08-04: before this existed, every Appstle-derived
+ * view (early-churn cohort, cancellation timing, dunning funnel) ignored
+ * the header's product picker entirely and always showed all-products
+ * numbers — only the Shopify-inference views (buildContracts and
+ * everything downstream of it) actually respected the filter. Callers
+ * that want an always-all-products comparison ANYWAY (e.g.
+ * computeChurnComparison, whose whole point is comparing scopes) should
+ * keep taking the full unfiltered array instead of this.
+ */
+export function filterAppstleSubsByProduct(
+  subs: RawAppstleSubscription[],
+  products: Set<string> | null,
+): RawAppstleSubscription[] {
+  return subs.filter((s) => matchesProducts(s.product, products));
+}
+
+/** Same idea for the billing-attempt rows (success/failed/skipped-dunning),
+ * which don't carry a product field of their own — joined via contract_id
+ * against the subscription ledger to find each event's product. */
+export function filterBillingEventsByProduct(
+  events: RawAppstleBillingEvent[],
+  subs: RawAppstleSubscription[],
+  products: Set<string> | null,
+): RawAppstleBillingEvent[] {
+  if (products === null || products.size === 0) return events;
+  const productByContract = new Map(subs.map((s) => [s.id, s.product]));
+  return events.filter((e) => matchesProducts(productByContract.get(e.contract_id) ?? null, products));
 }
 
 function inDateRange(dateOnly: string, range: DateRange): boolean {
@@ -492,9 +523,28 @@ export interface MrrResult {
   byPlan: Record<string, { activeSubscribers: number; mrr: number }>;
 }
 
-/** Current MRR snapshot — always "as of now", not affected by the date-range filter (only by the product filter, already baked into `contracts`). */
-export function computeMrr(contracts: Contract[]): MrrResult {
-  const active = contracts.filter((c) => c.status === "ACTIVE" && c.intervalMonths !== null);
+/**
+ * Current MRR snapshot — always "as of now", not affected by the
+ * date-range filter (only by the product filter, already baked into
+ * `contracts`).
+ *
+ * `excludeCustomerEmails`, when passed, drops any otherwise-ACTIVE
+ * contract whose customer email is in the set from the MRR sum — used to
+ * compute the "excluding skipped-dunning" variant (see
+ * computeSkippedDunningExposure below and the Subscriptions page's
+ * side-by-side MRR cards). Matched on customer email rather than a
+ * contract id because the Shopify-inferred `Contract` here and the
+ * Appstle billing-event ledger are two different data sources with no
+ * shared contract id — see computeSkippedDunningExposure's doc comment
+ * for why this join is approximate, not guaranteed-exact.
+ */
+export function computeMrr(contracts: Contract[], excludeCustomerEmails?: Set<string>): MrrResult {
+  const active = contracts.filter(
+    (c) =>
+      c.status === "ACTIVE" &&
+      c.intervalMonths !== null &&
+      !(excludeCustomerEmails && c.customerEmail && excludeCustomerEmails.has(c.customerEmail.toLowerCase())),
+  );
   const byPlan: Record<string, { activeSubscribers: number; mrr: number }> = {};
   let totalMrr = 0;
   for (const c of active) {
@@ -811,6 +861,333 @@ export function computeAppstleEarlyChurnCohort(appstleSubs: RawAppstleSubscripti
     });
   }
   return rows;
+}
+
+// ---------------------------------------------------------------------------
+// Real cancellation timing + dunning funnel (Appstle "Analytics" exports,
+// added 2026-08-04). Confirms/refutes the two hypotheses from the
+// 2026-08-03 team meeting: (1) cancellations aren't clustering right after
+// product delivery, they cluster around the renewal date; (2) a small
+// early-cancel cohort (0-3 days post-signup) likely maps to refund/
+// chargeback behavior rather than dissatisfaction with the product
+// itself. Also separates OPERATIONAL churn (Bedroom Stripes / Beef Organs
+// stockout, subscribers asked to swap or refund because the physical
+// product wasn't ready yet — see cancellation_note) from everything else,
+// since pooling the two overstates how much churn reflects real offer
+// dissatisfaction.
+// ---------------------------------------------------------------------------
+
+// Matches the free-text `cancellation_note` values seen in the CSV so far
+// for the Bedroom Stripes / Beef Organs / Dewlyte launch-without-stock
+// situation ("FITINHA - SEM ESTOQUE", "SEM ESTOQUE", "SEM ESTOQUE DO
+// PRODUTO") — see README for the operational backstory. Deliberately a
+// substring match on "estoque" (stock) rather than an exact-value list, so
+// new phrasing of the same root cause still gets caught.
+const STOCKOUT_NOTE_RE = /estoque/i;
+
+export function isStockoutCancellation(sub: RawAppstleSubscription): boolean {
+  return sub.status === "cancelled" && !!sub.cancellation_note && STOCKOUT_NOTE_RE.test(sub.cancellation_note);
+}
+
+function daysBetween(fromIso: string, toIso: string): number {
+  return (new Date(toIso).getTime() - new Date(fromIso).getTime()) / 86_400_000;
+}
+
+export interface CancellationTimingBucket {
+  label: string;
+  minDays: number;
+  maxDays: number | null; // null = open-ended (last bucket)
+  count: number;
+}
+
+const TIMING_BUCKETS: { label: string; minDays: number; maxDays: number | null }[] = [
+  { label: "0-1d", minDays: 0, maxDays: 1 },
+  { label: "1-3d", minDays: 1, maxDays: 3 },
+  { label: "3-7d", minDays: 3, maxDays: 7 },
+  { label: "7-14d", minDays: 7, maxDays: 14 },
+  { label: "14-21d", minDays: 14, maxDays: 21 },
+  { label: "21-30d", minDays: 21, maxDays: 30 },
+  { label: "30-45d", minDays: 30, maxDays: 45 },
+  { label: "45-60d", minDays: 45, maxDays: 60 },
+  { label: "60-90d", minDays: 60, maxDays: 90 },
+  { label: "90d+", minDays: 90, maxDays: null },
+];
+
+function bucketize(daysList: number[]): CancellationTimingBucket[] {
+  return TIMING_BUCKETS.map((b) => ({
+    ...b,
+    count: daysList.filter((d) => d >= b.minDays && (b.maxDays === null || d < b.maxDays)).length,
+  }));
+}
+
+export interface CancellationTimingResult {
+  /** Days from contract creation to cancellation date, for contracts that
+   * cancelled on/before their first renewal (renewalsReached-equivalent:
+   * Appstle cycles <= 1) — this is the bucket that would show a spike near
+   * day 0-14 if people were cancelling right after receiving the product. */
+  sinceSignupBeforeFirstRenewal: CancellationTimingBucket[];
+  /** Days from contract creation to cancellation date, for contracts that
+   * had already renewed at least once (cycles > 1) — cancelling well into
+   * an established subscription, not a first-impression reaction. */
+  sinceSignupAfterFirstRenewal: CancellationTimingBucket[];
+  /** Days from the LAST successful order to the cancellation date — only
+   * computable where a last_order_date exists (i.e. cycles > 1). Tight
+   * clustering near 0-3 days here is the "cancelled right after being
+   * charged again" pattern, distinct from "cancelled near the signup
+   * anniversary". */
+  sinceLastOrder: CancellationTimingBucket[];
+  /** Share of ALL cancellations (any cycle) that happened within 3 days of
+   * contract creation — the buyer's-remorse/possible-refund window the
+   * 2026-08-03 meeting flagged. Directional only: these CSVs don't carry
+   * Shopify refund/chargeback status, so this can't confirm the money
+   * actually went back, only that the cancellation was very early. */
+  earlyCancelWithin3DaysPct: number;
+  earlyCancelWithin3DaysCount: number;
+  totalCancelledWithDates: number;
+}
+
+export function computeCancellationTiming(appstleSubs: RawAppstleSubscription[]): CancellationTimingResult {
+  const cancelled = appstleSubs.filter((s) => s.status === "cancelled" && s.created_at && s.cancellation_date);
+
+  const sinceSignup = cancelled.map((s) => ({
+    days: daysBetween(s.created_at as string, s.cancellation_date as string),
+    beforeFirstRenewal: (s.cycles ?? 1) <= 1,
+  }));
+
+  const sinceLastOrderDays = cancelled
+    .filter((s) => s.last_order_date)
+    .map((s) => daysBetween(s.last_order_date as string, s.cancellation_date as string));
+
+  const earlyCount = sinceSignup.filter((r) => r.days <= 3).length;
+
+  return {
+    sinceSignupBeforeFirstRenewal: bucketize(sinceSignup.filter((r) => r.beforeFirstRenewal).map((r) => r.days)),
+    sinceSignupAfterFirstRenewal: bucketize(sinceSignup.filter((r) => !r.beforeFirstRenewal).map((r) => r.days)),
+    sinceLastOrder: bucketize(sinceLastOrderDays),
+    earlyCancelWithin3DaysPct: cancelled.length ? round2((100 * earlyCount) / cancelled.length) : 0,
+    earlyCancelWithin3DaysCount: earlyCount,
+    totalCancelledWithDates: cancelled.length,
+  };
+}
+
+export interface ChurnComparisonRow {
+  scope: string;
+  totalSubscriptions: number;
+  cancelled: number;
+  churnRatePct: number;
+}
+
+/**
+ * Side-by-side churn comparison requested at the 2026-08-03 meeting:
+ * aggregate (every product) vs. Bundle-only vs. everything-except-the-two
+ * launched-without-stock products (Bedroom Stripes, Beef Organs) vs.
+ * excluding only cancellations explicitly tagged as stockout-driven
+ * (isStockoutCancellation). The last row is the most surgical cut: it
+ * keeps Bundle Bedroom Stripes/Beef Organs subscribers who churned for
+ * ordinary reasons, and only removes the operational-launch noise.
+ */
+export function computeChurnComparison(appstleSubs: RawAppstleSubscription[]): ChurnComparisonRow[] {
+  const row = (scope: string, subs: RawAppstleSubscription[]): ChurnComparisonRow => {
+    const cancelled = subs.filter((s) => s.status === "cancelled").length;
+    return {
+      scope,
+      totalSubscriptions: subs.length,
+      cancelled,
+      churnRatePct: subs.length ? round2((100 * cancelled) / subs.length) : 0,
+    };
+  };
+
+  const STOCKOUT_LAUNCH_PRODUCTS = new Set(["Bedroom Stripes", "Beef Organs"]);
+  const bundleOnly = appstleSubs.filter((s) => s.product === "Bedroom Bundle");
+  const excludingStockoutProducts = appstleSubs.filter((s) => !STOCKOUT_LAUNCH_PRODUCTS.has(s.product ?? ""));
+  const excludingStockoutCancellations = appstleSubs.filter((s) => !isStockoutCancellation(s));
+
+  return [
+    row("Aggregate (all products)", appstleSubs),
+    row("Bedroom Bundle only", bundleOnly),
+    row("Excl. Bedroom Stripes + Beef Organs", excludingStockoutProducts),
+    row("Excl. stockout-tagged cancellations only", excludingStockoutCancellations),
+  ];
+}
+
+export interface StockoutChurnRow {
+  product: string;
+  totalCancelled: number;
+  stockoutCancelled: number;
+  stockoutSharePct: number;
+}
+
+/** Per-product breakdown of how much of that product's cancellation count
+ * is explained by the launched-without-stock operational situation vs.
+ * everything else (voluntary, silent non-renewal, unknown). */
+export function computeStockoutChurnByProduct(appstleSubs: RawAppstleSubscription[]): StockoutChurnRow[] {
+  const byProduct = new Map<string, RawAppstleSubscription[]>();
+  for (const s of appstleSubs) {
+    if (s.status !== "cancelled") continue;
+    const key = s.product ?? "(unknown)";
+    const arr = byProduct.get(key) ?? [];
+    arr.push(s);
+    byProduct.set(key, arr);
+  }
+  return [...byProduct.entries()]
+    .map(([product, subs]) => {
+      const stockoutCancelled = subs.filter(isStockoutCancellation).length;
+      return {
+        product,
+        totalCancelled: subs.length,
+        stockoutCancelled,
+        stockoutSharePct: subs.length ? round2((100 * stockoutCancelled) / subs.length) : 0,
+      };
+    })
+    .sort((a, b) => b.totalCancelled - a.totalCancelled);
+}
+
+export interface DunningFunnelResult {
+  failedAttempts: number;
+  skippedDunning: number;
+  successfulRetries: number;
+  /** Of the DISTINCT contracts that had at least one failed or
+   * skipped-dunning event, how many are cancelled vs. still active as of
+   * the subscription export (i.e. recovered or at least not yet
+   * cancelled). Joined by contract_id against the subscription export. */
+  distinctContractsAffected: number;
+  contractsNowCancelled: number;
+  contractsStillActive: number;
+  cancelledSharePct: number;
+  topErrorCodes: { code: string; count: number }[];
+  attemptCountDistribution: { attempts: number; count: number }[];
+}
+
+export function computeDunningFunnel(
+  billingEvents: RawAppstleBillingEvent[],
+  appstleSubs: RawAppstleSubscription[],
+): DunningFunnelResult {
+  const statusByContract = new Map(appstleSubs.map((s) => [s.id, s.status]));
+
+  const failed = billingEvents.filter((e) => e.outcome === "failed");
+  const skipped = billingEvents.filter((e) => e.outcome === "skipped_dunning");
+  const successful = billingEvents.filter((e) => e.outcome === "success");
+
+  const affectedContractIds = new Set([...failed, ...skipped].map((e) => e.contract_id));
+  let contractsNowCancelled = 0;
+  for (const id of affectedContractIds) {
+    if (statusByContract.get(id) === "cancelled") contractsNowCancelled += 1;
+  }
+  const distinctContractsAffected = affectedContractIds.size;
+  const contractsStillActive = distinctContractsAffected - contractsNowCancelled;
+
+  const errorCounts = new Map<string, number>();
+  for (const e of [...failed, ...skipped]) {
+    if (!e.error_code) continue;
+    errorCounts.set(e.error_code, (errorCounts.get(e.error_code) ?? 0) + 1);
+  }
+  const topErrorCodes = [...errorCounts.entries()]
+    .map(([code, count]) => ({ code, count }))
+    .sort((a, b) => b.count - a.count);
+
+  const attemptCounts = new Map<number, number>();
+  for (const e of failed) {
+    if (e.attempt_number === null) continue;
+    attemptCounts.set(e.attempt_number, (attemptCounts.get(e.attempt_number) ?? 0) + 1);
+  }
+  const attemptCountDistribution = [...attemptCounts.entries()]
+    .map(([attempts, count]) => ({ attempts, count }))
+    .sort((a, b) => a.attempts - b.attempts);
+
+  return {
+    failedAttempts: failed.length,
+    skippedDunning: skipped.length,
+    successfulRetries: successful.length,
+    distinctContractsAffected,
+    contractsNowCancelled,
+    contractsStillActive,
+    cancelledSharePct: distinctContractsAffected ? round2((100 * contractsNowCancelled) / distinctContractsAffected) : 0,
+    topErrorCodes,
+    attemptCountDistribution,
+  };
+}
+
+export interface SkippedDunningExposureRow {
+  contractId: string;
+  customerEmail: string;
+  /** Joined from the subscription ledger via contract_id — null if this
+   * contract_id isn't present in the current subscription export at all
+   * (a rolling-window mismatch between the two exports, see below). */
+  product: string | null;
+  lastBillingDate: string | null;
+}
+
+export interface SkippedDunningExposureResult {
+  currentlySkippedContracts: SkippedDunningExposureRow[];
+  currentlySkippedCount: number;
+  /** Lowercased customer emails of every currently-skipped contract — fed
+   * into computeMrr()'s excludeCustomerEmails to build the
+   * "excluding skipped-dunning" MRR figure. */
+  currentlySkippedCustomerEmails: Set<string>;
+}
+
+/**
+ * "Skipped dunning" (Appstle's own term) means: every retry attempt for a
+ * failed charge failed, and the contract's configured final action was
+ * "skip" rather than "cancel" — the subscription stays ACTIVE in
+ * Appstle's ledger, but that billing cycle was never actually paid. This
+ * is a THIRD state, distinct from both a normally-paying ACTIVE contract
+ * and a CANCELLED one. Left unexposed, these accounts silently count as
+ * full-paying ACTIVE subscribers in both the subscriber count and MRR
+ * (see computeMrr's excludeCustomerEmails param, fed from this).
+ *
+ * "Currently skipped" here means: of this contract's known billing-attempt
+ * history (success/failed/skipped_dunning rows, most-recent by
+ * billing_date), the LAST one is a skipped_dunning row — i.e. no
+ * successful charge is known to have happened since. Contracts Appstle's
+ * own subscription ledger already shows as "cancelled" are excluded here
+ * on purpose — the exposure this surfaces is specifically "still ACTIVE
+ * but not actually paying", not a plain, already-recorded cancellation
+ * (that's what computeDunningFunnel's cancelledSharePct already covers).
+ *
+ * IMPORTANT LIMITATION (surface this in the UI, don't just bury it in a
+ * comment): the 3 Appstle "Analytics" exports this reads from
+ * (success/failed/skipped-dunning past orders) are a rolling ~5-6 week
+ * window, not full history (confirmed 2026-08-04, see README). A contract
+ * that skipped dunning further back than that window, with no billing
+ * activity at all since, won't show ANY row in these exports and is
+ * therefore invisible here — this is a lower bound on real skipped-dunning
+ * exposure, not a complete count.
+ */
+export function computeSkippedDunningExposure(
+  billingEvents: RawAppstleBillingEvent[],
+  appstleSubs: RawAppstleSubscription[],
+): SkippedDunningExposureResult {
+  const productByContract = new Map(appstleSubs.map((s) => [s.id, s.product]));
+  const statusByContract = new Map(appstleSubs.map((s) => [s.id, s.status]));
+
+  const eventsByContract = new Map<string, RawAppstleBillingEvent[]>();
+  for (const e of billingEvents) {
+    const bucket = eventsByContract.get(e.contract_id) ?? [];
+    bucket.push(e);
+    eventsByContract.set(e.contract_id, bucket);
+  }
+
+  const rows: SkippedDunningExposureRow[] = [];
+  for (const [contractId, events] of eventsByContract) {
+    const sorted = [...events].sort((a, b) => (a.billing_date ?? "").localeCompare(b.billing_date ?? ""));
+    const last = sorted[sorted.length - 1];
+    if (last.outcome !== "skipped_dunning") continue;
+    if (statusByContract.get(contractId) === "cancelled") continue;
+
+    rows.push({
+      contractId,
+      customerEmail: last.customer_email,
+      product: productByContract.get(contractId) ?? null,
+      lastBillingDate: last.billing_date,
+    });
+  }
+
+  return {
+    currentlySkippedContracts: rows,
+    currentlySkippedCount: rows.length,
+    currentlySkippedCustomerEmails: new Set(rows.map((r) => r.customerEmail.toLowerCase())),
+  };
 }
 
 // ---------------------------------------------------------------------------

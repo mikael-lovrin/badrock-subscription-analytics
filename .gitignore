@@ -11,3 +11,8 @@ __pycache__/
 # payment brand/last4/expiry) that the site's JSON exports deliberately
 # never include — never let these reach git history.
 etl/manual-exports/*.csv
+
+# Same PII concern (phone, address, payment brand/last4/expiry) — this is
+# the folder Mikael drops fresh Appstle exports into before they get copied
+# into etl/manual-exports/. Never let these reach git history either.
+appstle-export/

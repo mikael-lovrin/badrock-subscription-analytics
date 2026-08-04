@@ -106,3 +106,40 @@ export interface AppstleSubscriptionsPayload {
   source_file: string | null;
   subscriptions: RawAppstleSubscription[];
 }
+
+/**
+ * One row per Appstle billing ATTEMPT (not per contract) — from the 3
+ * "Analytics" exports added 2026-08-04 (success / failed / skipped-dunning
+ * past orders, see etl/appstle_csv.py's load_appstle_billing_events()).
+ * Normalized to one shape across all three so the site can build a single
+ * failed -> skipped -> recovered/cancelled dunning funnel instead of three
+ * disconnected tables. Only ~5-6 weeks of recent activity is present in
+ * these exports as of the 2026-08-04 pull — treat any rate computed from
+ * this as directional, not a full-history number (see README).
+ */
+export interface RawAppstleBillingEvent {
+  contract_id: string;
+  customer_email: string;
+  outcome: "success" | "failed" | "skipped_dunning";
+  billing_date: string | null;
+  attempt_number: number | null;
+  error_code: string | null;
+  error_message: string | null;
+  /** Only populated on failed/skipped rows — how many charges this
+   * contract had successfully collected before this attempt. */
+  total_successful_orders: number | null;
+  last_successful_order_name: string | null;
+  last_successful_order_date: string | null;
+  /** Only populated on success rows. */
+  order_amount: number | null;
+  utm_campaign: string | null;
+  utm_content: string | null;
+  utm_medium: string | null;
+}
+
+export interface AppstleBillingEventsPayload {
+  generated_at: string;
+  captured_at: string | null;
+  sources: { success: string | null; failed: string | null; skipped_dunning: string | null };
+  events: RawAppstleBillingEvent[];
+}

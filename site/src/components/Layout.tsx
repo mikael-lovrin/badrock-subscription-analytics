@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { NavLink } from "react-router-dom";
-import { useFilters } from "../lib/FilterContext";
-import { useRawDataContext } from "../lib/RawDataContext";
+import { PRODUCT_CATEGORIES, useFilters } from "../lib/FilterContext";
 
 const NAV_ITEMS = [
   { to: "/", label: "Overview", end: true },
@@ -22,20 +21,39 @@ function useClickOutside<T extends HTMLElement>(onOutside: () => void) {
   return ref;
 }
 
+/**
+ * The site's single global product filter — every page and every
+ * Appstle-derived view reads `selectedProducts` from FilterContext, so
+ * this is the only product picker in the whole site (a page-local
+ * "Quick filter" used to duplicate part of this on the Subscriptions page
+ * — retired 2026-08-04 in favor of just this one, now that it covers the
+ * exact 4 categories Mikael wants: Bedroom Bundle, Bedroom Stripes, Beef
+ * Organs, Prime Organs). Real checkboxes, not a hidden single-select —
+ * more than one category can be checked at once (e.g. Bundle + Stripes)
+ * to compare scopes.
+ */
 function ProductMultiSelect() {
-  const raw = useRawDataContext();
   const { selectedProducts, setSelectedProducts } = useFilters();
   const [open, setOpen] = useState(false);
   const ref = useClickOutside<HTMLDivElement>(() => setOpen(false));
 
-  const products = raw.status === "ready" ? raw.data.products : [];
   const isAll = selectedProducts === null || selectedProducts.size === 0;
-  const label = isAll ? "All products" : selectedProducts.size === 1 ? [...selectedProducts][0] : `${selectedProducts.size} products`;
+  const checkedCategories = PRODUCT_CATEGORIES.filter((c) => c.skus.every((sku) => selectedProducts?.has(sku)));
+  const label = isAll
+    ? "All products"
+    : checkedCategories.length === 1
+      ? checkedCategories[0].label
+      : checkedCategories.length > 1
+        ? `${checkedCategories.length} products`
+        : "Custom selection"; // shouldn't normally happen — selectedProducts only ever gets set to whole categories below
 
-  const toggle = (product: string) => {
+  const toggleCategory = (skus: string[]) => {
     const next = new Set(selectedProducts ?? []);
-    if (next.has(product)) next.delete(product);
-    else next.add(product);
+    const allSelected = skus.every((sku) => next.has(sku));
+    for (const sku of skus) {
+      if (allSelected) next.delete(sku);
+      else next.add(sku);
+    }
     setSelectedProducts(next.size === 0 ? null : next);
   };
 
@@ -58,11 +76,19 @@ function ProductMultiSelect() {
           >
             All products
           </button>
-          <div className="max-h-64 overflow-y-auto">
-            {products.map((p) => (
-              <label key={p} className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-sm text-gray-700 hover:bg-gray-50">
-                <input type="checkbox" checked={selectedProducts?.has(p) ?? false} onChange={() => toggle(p)} className="accent-brand" />
-                {p}
+          <div>
+            {PRODUCT_CATEGORIES.map((category) => (
+              <label
+                key={category.label}
+                className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-sm text-gray-700 hover:bg-gray-50"
+              >
+                <input
+                  type="checkbox"
+                  checked={category.skus.every((sku) => selectedProducts?.has(sku) ?? false)}
+                  onChange={() => toggleCategory(category.skus)}
+                  className="accent-brand"
+                />
+                {category.label}
               </label>
             ))}
           </div>

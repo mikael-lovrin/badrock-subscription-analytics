@@ -37,6 +37,12 @@ and re-run the ETL before trusting any cohort further back than ~2
 months, or before assuming a "single order, no renewal history" contract
 is a genuine data gap rather than just this cap.
 
+**Fixed 2026-08-04** — `read_all_orders` is enabled; a fresh ETL run the
+same day pulled order history back to 2026-05-21 (previously capped at a
+rolling ~60 days), confirming the cap itself is no longer the limiting
+factor. See the note right below, though: this did **not** resolve the
+Bedroom Stripes gap, which turned out to be a separate, unrelated issue.
+
 ### Subscription lifecycle reconstruction (Shopify-only fallback)
 
 **Update 2026-08-04:** the override described as a "should" below is now
@@ -70,6 +76,38 @@ itself has rolled off the 60-day-ish pull window entirely for a product
 (see above), there's no Shopify contract to override in the first
 place — the fix only helps once a Shopify-inferred contract exists to
 attach the real status to.
+
+**Fixed 2026-08-04: synthetic contracts for products with zero Shopify
+history left.** The override above only ever adjusts an *existing*
+Shopify-derived contract's status — it can't create one from thin air.
+Bedroom Stripes exposed the gap concretely: its 8 real Appstle
+subscriptions were created 2026-06-07/08 and cancelled 2026-07-06, and
+`buildContracts()` found zero order-derived contracts for that product at
+all, so every main-dashboard card built on top of it (churn-by-cycle, MRR,
+active-subscriber counts) showed Bedroom Stripes as completely empty, even
+though the Appstle section of the Subscriptions page (which reads
+`appstleSubscriptions` directly, not through `buildContracts()`) showed
+the real ~100% churn correctly the whole time.
+
+**This was first assumed to be the 60-day Shopify pull cap (above) —
+that assumption was wrong.** After `read_all_orders` was enabled and a
+fresh ETL pull confirmed order history back to 2026-05-21 (well before
+Stripes' June signup dates), **Bedroom Stripes still had zero Shopify
+line items** across all 392 orders in that window. The actual cause is
+unconfirmed — the leading theory is that these 8 subscriptions, created
+while the product had launched without physical stock, never generated a
+real completed Shopify order in the first place (as opposed to an order
+that simply aged out of a pull window). Regardless of the exact cause,
+the fix below doesn't depend on knowing it: `buildContracts()` now runs a
+second pass after building Shopify-derived contracts — for every Appstle
+row whose (email, product) pair wasn't already covered by a
+Shopify-derived contract, it synthesizes a `Contract` directly from that
+row (`synthesizeContractFromAppstleSub()` in `metricsEngine.ts`,
+`contractId` prefixed `appstle::` so it can never collide with a
+Shopify-derived id). This makes the main cards and the Appstle section
+agree on churn for a product like Bedroom Stripes instead of one of them
+silently showing zero, whether the underlying gap is a pull-window cap,
+a missing order, or something else entirely.
 
 Wherever no matching Appstle CSV row exists, subscription lifecycle is
 reconstructed from Shopify order history instead of a real billing

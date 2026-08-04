@@ -436,6 +436,22 @@ export interface Contract {
  * `computeSkippedDunningExposure`/the Appstle section — there's no shared
  * contract id between Shopify and Appstle, so this is a best-effort match,
  * not a guaranteed-exact one).
+ *
+ * **Synthetic contracts for Appstle-only subscriptions (added 2026-08-04):**
+ * the override above only ever adjusts a contract that already exists from
+ * Shopify order history — it never creates one. That's a real gap: once a
+ * product's entire order history has aged out of the ETL's 60-day Shopify
+ * pull window (see README), there's no Shopify-derived contract left to
+ * attach the real Appstle status to, so that product goes completely
+ * invisible on every card fed by `buildContracts()` even though Appstle's
+ * ledger has its full real history. After the main pass below, a second
+ * pass walks every row of `appstleSubs` and, for any (email, product) pair
+ * that no Shopify-derived contract ever covered, synthesizes a `Contract`
+ * directly from that Appstle row via `synthesizeContractFromAppstleSub()` —
+ * prefixed `appstle::` in `contractId` so it can never collide with a
+ * Shopify-derived id. See that function's doc comment for exactly which
+ * fields are estimated (e.g. per-cycle price from `total_revenue / cycles`)
+ * vs. taken as-is from Appstle.
  */
 /**
  * Groups Appstle subscription-ledger rows by lowercased email + product —
@@ -489,6 +505,52 @@ function findMatchingAppstleSub(
   }, bucket[0]);
 }
 
+/**
+ * Synthesizes a Contract directly from an Appstle ledger row, for the case
+ * where NO Shopify-derived contract exists to attach real status to at all
+ * (see `buildContracts`' second pass below). Returns null when the row
+ * can't be turned into a usable contract without inventing data: no
+ * product (can't apply the product filter), or no date anywhere to use as
+ * `createdAt` (cohort membership) — better to drop the row than guess.
+ */
+function synthesizeContractFromAppstleSub(sub: RawAppstleSubscription): Contract | null {
+  if (!sub.product) return null;
+  const createdAt = sub.created_at;
+  if (!createdAt) return null;
+
+  const planLabel = sub.interval_months !== null ? MONTHS_TO_LABEL[sub.interval_months] ?? `${sub.interval_months}x monthly` : "unknown";
+  const cycles = sub.cycles && sub.cycles > 0 ? sub.cycles : 1;
+  const estimatedPrice = Math.round((sub.total_revenue / cycles) * 100) / 100;
+  const isCancelled = sub.status.toLowerCase() === "cancelled";
+
+  const event: SubscriptionEvent = {
+    date: sub.last_order_date ?? createdAt,
+    price: estimatedPrice,
+    quantity: 1,
+    plan: sub.interval_months ? { months: sub.interval_months, label: planLabel } : null,
+    extraRevenue: 0,
+    financialStatus: "PAID",
+    product: sub.product,
+    isAppstleFirstOrder: true,
+  };
+
+  return {
+    contractId: `appstle::${sub.id}`,
+    customerId: `appstle-email::${sub.customer_email.toLowerCase()}`,
+    customerEmail: sub.customer_email,
+    product: sub.product,
+    planLabel,
+    intervalMonths: sub.interval_months,
+    createdAt,
+    events: [event],
+    status: isCancelled ? "CANCELLED" : "ACTIVE",
+    cancelledOn: sub.cancellation_date,
+    lifetimeValue: round2(sub.total_revenue),
+    renewalsReached: Math.max(0, (sub.cycles ?? 1) - 1),
+    lastOrderRefunded: false,
+  };
+}
+
 export function buildContracts(
   orders: RawOrder[],
   lineItems: RawLineItem[],
@@ -497,6 +559,11 @@ export function buildContracts(
 ): Contract[] {
   const orderById = new Map(orders.map((o) => [o.id, o]));
   const appstleIndex = buildAppstleIndexByEmailProduct(appstleSubs);
+  // Tracks which (email, product) pairs already got a Shopify-derived
+  // contract, so the synthetic-contract pass below only fills in the gaps
+  // instead of duplicating coverage. Populated during the main loop as each
+  // Shopify-derived contract is built.
+  const coveredEmailProductKeys = new Set<string>();
 
   // Step 1: one billing event per (order, product) — never per line item,
   // in case a product still ends up with more than one non-upsell [R]
@@ -594,7 +661,29 @@ export function buildContracts(
         renewalsReached: contractEvents.length - 1,
         lastOrderRefunded: REFUNDED_STATUSES.has(last.financialStatus),
       });
+
+      if (email) coveredEmailProductKeys.add(`${email.toLowerCase()}::${last.product}`);
     });
+  }
+
+  // Second pass — synthesize contracts for Appstle subscriptions that have
+  // NO corresponding Shopify-derived contract at all (as opposed to the
+  // override above, which only ever REPLACES the status of a contract that
+  // already exists). Without this, a product whose entire Shopify order
+  // history has rolled off the ETL's 60-day pull window (see README's
+  // "Shopify order history is capped at 60 days") ends up with zero
+  // Shopify-derived contracts, so every main dashboard card fed by
+  // `buildContracts()` (churn-by-cycle, MRR, active-subscriber counts)
+  // silently shows that product as empty/zero — even though the Appstle
+  // ledger has its full real history. Confirmed case: Bedroom Stripes' 8
+  // real subscriptions (created 2026-06-07/08, cancelled 2026-07-06) are
+  // fully outside the Shopify order window as of 2026-08-04.
+  for (const sub of appstleSubs) {
+    if (!sub.customer_email || !sub.product) continue;
+    const key = `${sub.customer_email.toLowerCase()}::${sub.product}`;
+    if (coveredEmailProductKeys.has(key)) continue;
+    const synthesized = synthesizeContractFromAppstleSub(sub);
+    if (synthesized) contracts.push(synthesized);
   }
 
   return contracts.filter((c) => matchesProducts(c.product, products));

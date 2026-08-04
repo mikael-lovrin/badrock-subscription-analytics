@@ -45,8 +45,8 @@ function SubscriptionsContent({ data }: { data: RawData }) {
   const { selectedProducts, dateRange } = useFilters();
 
   const contracts = useMemo(
-    () => buildContracts(data.orders, data.lineItems, selectedProducts),
-    [data.orders, data.lineItems, selectedProducts],
+    () => buildContracts(data.orders, data.lineItems, selectedProducts, data.appstleSubscriptions),
+    [data.orders, data.lineItems, selectedProducts, data.appstleSubscriptions],
   );
 
   // Everything below joins the REAL Appstle ledger, not the Shopify

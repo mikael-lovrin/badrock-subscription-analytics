@@ -420,9 +420,83 @@ export interface Contract {
  * order as the real plan line, same product, same day; counting them as
  * their own billing event would fabricate a same-day "renewal" that never
  * happened. Their revenue still rolls into lifetimeValue.
+ *
+ * **`status`/`cancelledOn` override from the real Appstle ledger (added
+ * 2026-08-04):** confirmed against a real export that the Shopify-silence
+ * heuristic below undercounts cancellations substantially — a subscriber
+ * who cancels proactively without ever placing (or missing) an order
+ * leaves nothing in order history to infer from, so they read as ACTIVE
+ * forever (Bedroom Stripes was the extreme case: ~0% inferred churn here
+ * vs. ~100% real cancellation in the Appstle ledger). Wherever a contract
+ * can be matched to a row in `appstleSubs`, that row's real `status` and
+ * `cancellation_date` win outright, overriding the inferred ACTIVE/
+ * CANCELLED below; contracts with no match keep using the heuristic — see
+ * `matchAppstleSub()`'s doc comment for the join itself and its known
+ * limitation (same email+product join used by
+ * `computeSkippedDunningExposure`/the Appstle section — there's no shared
+ * contract id between Shopify and Appstle, so this is a best-effort match,
+ * not a guaranteed-exact one).
  */
-export function buildContracts(orders: RawOrder[], lineItems: RawLineItem[], products: Set<string> | null): Contract[] {
+/**
+ * Groups Appstle subscription-ledger rows by lowercased email + product —
+ * the same join key `computeSkippedDunningExposure`/the Appstle section use
+ * (there's no contract id shared between Shopify and Appstle at all, so
+ * this is the best correspondence available, not a guaranteed-exact one).
+ * Returns a Map so `findMatchingAppstleSub` can disambiguate when a
+ * customer has more than one Appstle row for the same product (e.g.
+ * cancelled once and resubscribed) by nearest signup date.
+ */
+function buildAppstleIndexByEmailProduct(appstleSubs: RawAppstleSubscription[]): Map<string, RawAppstleSubscription[]> {
+  const index = new Map<string, RawAppstleSubscription[]>();
+  for (const sub of appstleSubs) {
+    if (!sub.customer_email || !sub.product) continue;
+    const key = `${sub.customer_email.toLowerCase()}::${sub.product}`;
+    const bucket = index.get(key) ?? [];
+    bucket.push(sub);
+    index.set(key, bucket);
+  }
+  return index;
+}
+
+/**
+ * Finds the Appstle row to trust for one Shopify-inferred contract. Match
+ * key is (customer email lowercased, product) — same limitation as noted
+ * throughout this file: no shared contract id, so this can be wrong if,
+ * say, a customer emails aren't set on the Shopify order (`email === null`
+ * — never matches, falls back to the heuristic) or if the same
+ * email+product pair legitimately has more than one Appstle row (a
+ * cancel-then-resubscribe). In the multiple-match case, picks whichever
+ * Appstle row's `created_at` is closest to this contract's own
+ * `createdAt` — the best available disambiguator without a shared id.
+ */
+function findMatchingAppstleSub(
+  index: Map<string, RawAppstleSubscription[]>,
+  email: string | null,
+  product: string,
+  contractCreatedAt: string,
+): RawAppstleSubscription | null {
+  if (!email) return null;
+  const bucket = index.get(`${email.toLowerCase()}::${product}`);
+  if (!bucket || bucket.length === 0) return null;
+  if (bucket.length === 1) return bucket[0];
+  const targetTime = new Date(contractCreatedAt).getTime();
+  return bucket.reduce((closest, candidate) => {
+    if (!candidate.created_at) return closest;
+    if (!closest.created_at) return candidate;
+    const closestDiff = Math.abs(new Date(closest.created_at).getTime() - targetTime);
+    const candidateDiff = Math.abs(new Date(candidate.created_at).getTime() - targetTime);
+    return candidateDiff < closestDiff ? candidate : closest;
+  }, bucket[0]);
+}
+
+export function buildContracts(
+  orders: RawOrder[],
+  lineItems: RawLineItem[],
+  products: Set<string> | null,
+  appstleSubs: RawAppstleSubscription[] = [],
+): Contract[] {
   const orderById = new Map(orders.map((o) => [o.id, o]));
+  const appstleIndex = buildAppstleIndexByEmailProduct(appstleSubs);
 
   // Step 1: one billing event per (order, product) — never per line item,
   // in case a product still ends up with more than one non-upsell [R]
@@ -490,6 +564,19 @@ export function buildContracts(orders: RawOrder[], lineItems: RawLineItem[], pro
       const isActive = daysSinceLast <= graceMonths * AVG_DAYS_PER_MONTH;
       const expectedNextBilling = new Date(lastEventAt.getTime() + (intervalMonths ?? 1) * AVG_DAYS_PER_MONTH * 86_400_000);
 
+      let status: "ACTIVE" | "CANCELLED" = isActive ? "ACTIVE" : "CANCELLED";
+      let cancelledOn: string | null = isActive ? null : expectedNextBilling.toISOString();
+
+      // Real-Appstle override — see buildContracts' doc comment above. Only
+      // applied when a match exists; otherwise the Shopify-silence
+      // heuristic just computed above stands as the fallback.
+      const matchedSub = findMatchingAppstleSub(appstleIndex, email, last.product, contractEvents[0].date);
+      if (matchedSub) {
+        const reallyCancelled = matchedSub.status.toLowerCase() === "cancelled";
+        status = reallyCancelled ? "CANCELLED" : "ACTIVE";
+        cancelledOn = reallyCancelled ? matchedSub.cancellation_date ?? cancelledOn : null;
+      }
+
       contracts.push({
         contractId: `${customerId}::${idx}::${contractEvents[0].product}`,
         customerId,
@@ -499,8 +586,8 @@ export function buildContracts(orders: RawOrder[], lineItems: RawLineItem[], pro
         intervalMonths,
         createdAt: contractEvents[0].date,
         events: contractEvents,
-        status: isActive ? "ACTIVE" : "CANCELLED",
-        cancelledOn: isActive ? null : expectedNextBilling.toISOString(),
+        status,
+        cancelledOn,
         lifetimeValue: round2(
           contractEvents.reduce((sum, e) => sum + e.price * e.quantity + e.extraRevenue, 0),
         ),

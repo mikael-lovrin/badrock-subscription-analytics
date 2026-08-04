@@ -39,6 +39,38 @@ is a genuine data gap rather than just this cap.
 
 ### Subscription lifecycle reconstruction (Shopify-only fallback)
 
+**Update 2026-08-04:** the override described as a "should" below is now
+implemented, not just aspirational. `buildContracts()` in
+`site/src/lib/metricsEngine.ts` takes `RawAppstleSubscription[]` as a
+parameter and, for every contract, tries to find a matching Appstle ledger
+row (joined on lowercased customer email + product — the same join key
+`computeSkippedDunningExposure`/the Appstle section already used, chosen
+for the same reason: there's no shared contract id between Shopify and
+Appstle at all, so this is a best-effort match, not a guaranteed-exact
+one; see `findMatchingAppstleSub()`'s doc comment). When a match exists,
+that row's real `status`/`cancellation_date` **replace** the
+inferred ACTIVE/CANCELLED and `cancelledOn` outright — the heuristic below
+only stands for contracts with no match. This fixed a real, confirmed
+discrepancy: Bedroom Stripes (launched without stock, essentially 100%
+cancelled per the real Appstle ledger — see "Real cancellation timing +
+dunning funnel" below) was showing ~0% churn on the main Subscriptions
+page's churn-by-cycle card, because the Shopify-silence heuristic hadn't
+caught up yet for contracts still inside their grace window. Every caller
+of `buildContracts()` (`Subscriptions.tsx`, `Overview.tsx`) now passes
+`data.appstleSubscriptions` alongside the usual orders/line-items/product
+args.
+
+**Known edge case in the join:** a Shopify contract whose order has no
+`email` can never match (the heuristic below is its only source of
+truth). Where a customer has more than one Appstle row for the same
+email+product (e.g. cancelled once and resubscribed later), the nearest
+match by signup date (`created_at`) is used — there's no better
+disambiguator without a shared id. And where the Shopify order history
+itself has rolled off the 60-day-ish pull window entirely for a product
+(see above), there's no Shopify contract to override in the first
+place — the fix only helps once a Shopify-inferred contract exists to
+attach the real status to.
+
 Wherever no matching Appstle CSV row exists, subscription lifecycle is
 reconstructed from Shopify order history instead of a real billing
 ledger:
@@ -271,6 +303,18 @@ from `buildContracts()`, which groups Appstle-tagged order line items by
   the count as a lower bound, not a complete one. This is purely
   observational exposure, not a status change: no contract's real
   Appstle status is altered or auto-cancelled by this.
+- **Revenue vs. MRR under skipped dunning (clarified 2026-08-04, no code
+  change needed):** "Total revenue" (`computeRevenueSummary`, Overview
+  page) is a straight sum of real Shopify order totals — a skipped-dunning
+  cycle never creates an order, so it is already excluded automatically,
+  with no special-casing required. MRR is the opposite by design: it's
+  the committed recurring rate, not cash collected, so it intentionally
+  keeps counting a skipped-dunning contract (the "including skipped
+  dunning" figure above) unless you deliberately look at the "excluding"
+  side-by-side figure. Don't conflate the two — revenue answers "what did
+  we actually collect," MRR answers "what are we on the hook to deliver
+  against." Both KPI cards on the Overview page now carry a hint
+  explaining this distinction inline.
 - **Churn by renewal cycle** — cycle 1 = first renewal. Churn at cycle N =
   contracts whose last successful renewal is N and are now `CANCELLED`,
   divided by contracts that reached cycle N at all.

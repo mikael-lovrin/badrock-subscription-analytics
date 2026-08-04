@@ -17,7 +17,10 @@ function OverviewContent({ data }: { data: RawData }) {
 
   const summary = useMemo(() => computeRevenueSummary(data.orders, data.lineItems, filters), [data, selectedProducts, dateRange]);
   const trend = useMemo(() => computeRevenueTrend(data.orders, data.lineItems, filters), [data, selectedProducts, dateRange]);
-  const contracts = useMemo(() => buildContracts(data.orders, data.lineItems, selectedProducts), [data, selectedProducts]);
+  const contracts = useMemo(
+    () => buildContracts(data.orders, data.lineItems, selectedProducts, data.appstleSubscriptions),
+    [data, selectedProducts],
+  );
   const mrr = useMemo(() => computeMrr(contracts), [contracts]);
 
   return (
@@ -25,10 +28,18 @@ function OverviewContent({ data }: { data: RawData }) {
       <PageHeader title="Overview" description="Store-wide revenue and order KPIs." generatedAt={data.generatedAt} />
 
       <div className="mb-6 grid grid-cols-2 gap-4 lg:grid-cols-4">
-        <KpiCard label="Total revenue" value={formatCurrency(summary.totalRevenue)} />
+        <KpiCard
+          label="Total revenue"
+          value={formatCurrency(summary.totalRevenue)}
+          hint="Actual charges only — a skipped-dunning cycle never creates a Shopify order, so it's automatically excluded here."
+        />
         <KpiCard label="Orders" value={formatNumber(summary.totalOrders)} />
         <KpiCard label="AOV" value={formatCurrency(summary.aov)} />
-        <KpiCard label="MRR" value={formatCurrency(mrr.totalMrr)} hint="See Subscriptions for full breakdown" />
+        <KpiCard
+          label="MRR"
+          value={formatCurrency(mrr.totalMrr)}
+          hint="Committed recurring rate, not cash collected — intentionally unaffected by skipped-dunning cycles. See Subscriptions for the full breakdown and the skipped-dunning exposure view."
+        />
       </div>
 
       <Card title="Revenue trend" subtitle="Daily revenue" className="mb-6">

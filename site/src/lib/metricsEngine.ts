@@ -364,6 +364,32 @@ export interface Contract {
    */
   renewalsReached: number;
   /**
+   * How many full `intervalMonths` periods have elapsed between `createdAt`
+   * and the reference date (`cancelledOn` if CANCELLED, otherwise "now") —
+   * i.e. how many renewal dates *should* have come up by now, independent
+   * of whether the billing attempt on each of those dates ever succeeded.
+   * Added 2026-08-05 specifically to fix a semantics bug where
+   * `renewalsReached` (successful renewals only) was also being used as the
+   * ELIGIBILITY criterion for "has this contract reached cycle N at all" in
+   * `computeChurnByCycle`/`computeCohortRetention` — which silently treated
+   * "genuinely too new to have a renewal date yet" and "renewal date came,
+   * charge failed/was skipped, contract eventually cancelled without ever
+   * successfully renewing" as the same bucket ("renewalsReached: 0"), even
+   * though only the first case should read as "aguardando". Real example
+   * that exposed this: Nyle Wells (nyle713@hotmail.com, contract
+   * `appstle::21697429660`, Bedroom Bundle monthly) signed up 2026-05-28,
+   * had the 2026-06-28 renewal charge fail and get skipped
+   * (SKIPPED_DUNNING_MGMT — nominally still ACTIVE, never actually paid),
+   * then had the 2026-07-28 retry fail again and got CANCELLED —
+   * `renewalsReached: 0` the whole time (never a *successful* renewal), but
+   * `cyclesDue` correctly reads 2 by the cancellation date, since two full
+   * monthly renewal windows had genuinely come and gone. Use `cyclesDue` to
+   * decide ELIGIBILITY/the denominator ("has this contract's cycle-N
+   * renewal date arrived, resolved or not"); keep using `renewalsReached`
+   * to decide whether the outcome was real retention (the numerator).
+   */
+  cyclesDue: number;
+  /**
    * Whether the LAST order on this contract — the one after which the
    * subscriber went silent — came back REFUNDED or PARTIALLY_REFUNDED.
    * Distinguishes an explicit "I want my money back" cancellation from
@@ -506,6 +532,23 @@ function findMatchingAppstleSub(
 }
 
 /**
+ * How many full `intervalMonths` billing periods have elapsed between
+ * `createdAt` and `referenceDate` — see `Contract.cyclesDue`'s doc comment
+ * for why this exists (time-based renewal eligibility, independent of
+ * whether the charge on each of those dates actually succeeded). `months`
+ * defaults to 1 when the plan couldn't be resolved, matching the same
+ * fallback `CHURN_GRACE_MULTIPLIER`'s grace-window calc already uses
+ * elsewhere in this file. Never negative — a referenceDate before
+ * `createdAt` (shouldn't happen, but defensive) floors to 0.
+ */
+function computeCyclesDue(createdAt: string, intervalMonths: number | null, referenceDate: Date): number {
+  const months = intervalMonths ?? 1;
+  const elapsedDays = (referenceDate.getTime() - new Date(createdAt).getTime()) / 86_400_000;
+  if (elapsedDays <= 0) return 0;
+  return Math.floor(elapsedDays / (months * AVG_DAYS_PER_MONTH));
+}
+
+/**
  * Synthesizes a Contract directly from an Appstle ledger row, for the case
  * where NO Shopify-derived contract exists to attach real status to at all
  * (see `buildContracts`' second pass below). Returns null when the row
@@ -513,7 +556,7 @@ function findMatchingAppstleSub(
  * product (can't apply the product filter), or no date anywhere to use as
  * `createdAt` (cohort membership) — better to drop the row than guess.
  */
-function synthesizeContractFromAppstleSub(sub: RawAppstleSubscription): Contract | null {
+function synthesizeContractFromAppstleSub(sub: RawAppstleSubscription, now: Date): Contract | null {
   if (!sub.product) return null;
   const createdAt = sub.created_at;
   if (!createdAt) return null;
@@ -522,6 +565,7 @@ function synthesizeContractFromAppstleSub(sub: RawAppstleSubscription): Contract
   const cycles = sub.cycles && sub.cycles > 0 ? sub.cycles : 1;
   const estimatedPrice = Math.round((sub.total_revenue / cycles) * 100) / 100;
   const isCancelled = sub.status.toLowerCase() === "cancelled";
+  const referenceDate = isCancelled ? new Date(sub.cancellation_date ?? createdAt) : now;
 
   const event: SubscriptionEvent = {
     date: sub.last_order_date ?? createdAt,
@@ -547,6 +591,7 @@ function synthesizeContractFromAppstleSub(sub: RawAppstleSubscription): Contract
     cancelledOn: sub.cancellation_date,
     lifetimeValue: round2(sub.total_revenue),
     renewalsReached: Math.max(0, (sub.cycles ?? 1) - 1),
+    cyclesDue: computeCyclesDue(createdAt, sub.interval_months, referenceDate),
     lastOrderRefunded: false,
   };
 }
@@ -644,6 +689,8 @@ export function buildContracts(
         cancelledOn = reallyCancelled ? matchedSub.cancellation_date ?? cancelledOn : null;
       }
 
+      const cyclesDueReferenceDate = status === "CANCELLED" ? new Date(cancelledOn ?? contractEvents[0].date) : now;
+
       contracts.push({
         contractId: `${customerId}::${idx}::${contractEvents[0].product}`,
         customerId,
@@ -659,6 +706,7 @@ export function buildContracts(
           contractEvents.reduce((sum, e) => sum + e.price * e.quantity + e.extraRevenue, 0),
         ),
         renewalsReached: contractEvents.length - 1,
+        cyclesDue: computeCyclesDue(contractEvents[0].date, intervalMonths, cyclesDueReferenceDate),
         lastOrderRefunded: REFUNDED_STATUSES.has(last.financialStatus),
       });
 
@@ -682,7 +730,7 @@ export function buildContracts(
     if (!sub.customer_email || !sub.product) continue;
     const key = `${sub.customer_email.toLowerCase()}::${sub.product}`;
     if (coveredEmailProductKeys.has(key)) continue;
-    const synthesized = synthesizeContractFromAppstleSub(sub);
+    const synthesized = synthesizeContractFromAppstleSub(sub, now);
     if (synthesized) contracts.push(synthesized);
   }
 
@@ -743,22 +791,64 @@ export interface ChurnByCycleRow {
 }
 
 /**
- * For each renewal cycle N (1 = first renewal): how many contracts
- * reached cycle N (renewalsReached >= N), and of those, how many never
- * made it to cycle N+1 because they're CANCELLED with exactly N renewals.
+ * Shared eligibility/outcome calc behind both `computeChurnByCycle` and
+ * `computeCohortRetention` — see `Contract.cyclesDue`'s doc comment for the
+ * full backstory (Nyle Wells case) on why `renewalsReached` alone can't be
+ * the eligibility criterion.
+ *
+ * For a group of contracts and one renewal cycle N, returns:
+ * - `matured` — the DENOMINATOR: contracts whose cycle-N renewal window has
+ *   genuinely arrived, resolved or not (`cyclesDue >= N`), OR'd with
+ *   `renewalsReached >= N` so a contract that already renewed N times
+ *   always counts as matured even if the elapsed-days floor calc hasn't
+ *   quite caught up yet (e.g. a renewal landing same-day as the metrics
+ *   snapshot) — without the OR, `reached` could exceed `matured` and the
+ *   churn count would go negative.
+ * - `reached` — the NUMERATOR: contracts that actually renewed N times
+ *   (`renewalsReached >= N`) — real retention, not just elapsed time.
+ *
+ * Cycle 0 is special: it's the pre-first-renewal period every contract is
+ * born into immediately, so there's no elapsed-time wait to speak of —
+ * `matured` is always the whole group. `reached` (survived past the initial
+ * period) excludes only contracts that are CANCELLED having died before
+ * their first renewal date even arrived (`cyclesDue === 0`) — i.e. the
+ * "Renewal 0" column answers "did they cancel before any renewal charge
+ * was even attempted."
+ */
+function maturityAtCycle(group: Contract[], cycle: number): { matured: number; reached: number } {
+  if (cycle === 0) {
+    const churnedBeforeFirstRenewal = group.filter((c) => c.status === "CANCELLED" && c.cyclesDue === 0).length;
+    return { matured: group.length, reached: group.length - churnedBeforeFirstRenewal };
+  }
+  const matured = group.filter((c) => c.cyclesDue >= cycle || c.renewalsReached >= cycle).length;
+  const reached = group.filter((c) => c.renewalsReached >= cycle).length;
+  return { matured, reached };
+}
+
+/**
+ * For each renewal cycle N (0 = the pre-first-renewal period, 1 = first
+ * renewal, ...): how many contracts are ELIGIBLE for cycle N — their
+ * renewal-N date has genuinely arrived, whether or not the charge on it
+ * ever succeeded (see `maturityAtCycle`) — and of those, how many did NOT
+ * actually renew that far (`cancelledAtThisCycle` = eligible minus actually
+ * retained). `reachedCycle` here names the denominator (eligible count),
+ * kept as the field name for backward compatibility with existing callers;
+ * see `maturityAtCycle`'s doc comment for the full semantics, notably that
+ * this now correctly includes contracts whose renewal charge was attempted
+ * and failed/was skipped, even though they have `renewalsReached: 0`.
  */
 export function computeChurnByCycle(contracts: Contract[], dateRange: DateRange, maxCycle = 12): ChurnByCycleRow[] {
   const cohort = contractsInCohortRange(contracts, dateRange);
   const rows: ChurnByCycleRow[] = [];
-  for (let cycle = 1; cycle <= maxCycle; cycle++) {
-    const reached = cohort.filter((c) => c.renewalsReached >= cycle);
-    if (reached.length === 0) break;
-    const cancelledHere = reached.filter((c) => c.renewalsReached === cycle && c.status === "CANCELLED");
+  for (let cycle = 0; cycle <= maxCycle; cycle++) {
+    const { matured, reached } = maturityAtCycle(cohort, cycle);
+    if (matured === 0) break;
+    const cancelledHere = matured - reached;
     rows.push({
       cycle,
-      reachedCycle: reached.length,
-      cancelledAtThisCycle: cancelledHere.length,
-      churnRatePct: round2((100 * cancelledHere.length) / reached.length),
+      reachedCycle: matured,
+      cancelledAtThisCycle: cancelledHere,
+      churnRatePct: round2((100 * cancelledHere) / matured),
     });
   }
   return rows;
@@ -807,14 +897,24 @@ export interface CohortRetentionRow {
   cohortSize: number;
   retentionByCyclePct: Record<number, number>;
   /**
-   * How many of the cohort have a *resolved* outcome for that cycle —
-   * either they reached it, or they're CANCELLED having stalled before
-   * reaching it. The denominator behind retentionByCyclePct. Deliberately
-   * excludes contracts that are still ACTIVE with renewalsReached < cycle:
-   * their renewal date for that cycle hasn't come up yet, so they're
-   * neither a retention nor a churn data point — including them in the
-   * denominator is what used to make a fresh cohort read as mostly
+   * How many of the cohort are ELIGIBLE for that cycle — see
+   * `maturityAtCycle`/`Contract.cyclesDue`'s doc comments for the full
+   * backstory. Updated 2026-08-05: eligibility is now time-based
+   * (`cyclesDue >= cycle`, i.e. the renewal date genuinely arrived, whether
+   * or not the charge on it succeeded), OR'd with `renewalsReached >=
+   * cycle` — NOT `renewalsReached < cycle && CANCELLED` as before, which
+   * silently excluded a contract whose renewal charge was attempted and
+   * failed/was skipped but never formally succeeded (renewalsReached stays
+   * 0 forever even though real time passed and a real charge attempt
+   * happened — see the Nyle Wells case in Contract.cyclesDue's comment).
+   * The denominator behind retentionByCyclePct. Still deliberately excludes
+   * contracts that are genuinely too new — still ACTIVE with `cyclesDue <
+   * cycle`: their renewal date for that cycle hasn't come up yet at all, so
+   * they're neither a retention nor a churn data point — including them in
+   * the denominator is what used to make a fresh cohort read as mostly
    * churned when really most of it just hadn't had a chance to renew yet.
+   * Cycle 0 (added 2026-08-05) is the pre-first-renewal period every
+   * contract is born into immediately, so it's always the full cohort size.
    */
   maturedByCycle: Record<number, number>;
   /** Numerator behind retentionByCyclePct — exposed so the UI can show the exact "reached/matured" fraction instead of just the rounded %. */
@@ -836,11 +936,9 @@ export function computeCohortRetention(contracts: Contract[], dateRange: DateRan
     const retentionByCyclePct: Record<number, number> = {};
     const maturedByCycle: Record<number, number> = {};
     const reachedByCycle: Record<number, number> = {};
-    for (let cycle = 1; cycle <= maxCycle; cycle++) {
-      const reached = group.filter((c) => c.renewalsReached >= cycle).length;
-      if (reached === 0) break;
-      const churnedBeforeReaching = group.filter((c) => c.status === "CANCELLED" && c.renewalsReached < cycle).length;
-      const matured = reached + churnedBeforeReaching;
+    for (let cycle = 0; cycle <= maxCycle; cycle++) {
+      const { matured, reached } = maturityAtCycle(group, cycle);
+      if (matured === 0) break;
       maturedByCycle[cycle] = matured;
       reachedByCycle[cycle] = reached;
       retentionByCyclePct[cycle] = round2((100 * reached) / matured);

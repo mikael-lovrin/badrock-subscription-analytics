@@ -17,6 +17,18 @@ interface CohortHeatmapProps {
  * cell = % of that cohort's *resolved* outcomes that renewed (see
  * maturedByCycle in metricsEngine.ts) — cycles nobody in that cohort has
  * actually reached yet render as "aguardando" rather than a misleading 0%.
+ *
+ * "Renewal 0" (added 2026-08-05) is the pre-first-renewal period every
+ * contract is born into — % = how many of the cohort survived to see their
+ * first renewal DATE at all (whether or not that first charge succeeded),
+ * vs. cancelled before it ever arrived. "Renewal 1" onward answers a
+ * different question: of those whose renewal-N date has come and gone
+ * (resolved OR not — see Contract.cyclesDue in metricsEngine.ts), how many
+ * actually renewed successfully that many times. This distinction matters
+ * because a renewal charge can be attempted and fail/get skipped without
+ * the contract being CANCELLED yet (Appstle's "skipped dunning" behavior) —
+ * that subscriber belongs in "Renewal 1", not "Renewal 0", even though
+ * `renewalsReached` alone would say 0 either way.
  */
 export function CohortHeatmap({ rows, planMix }: CohortHeatmapProps) {
   if (rows.length === 0) {
@@ -42,7 +54,7 @@ export function CohortHeatmap({ rows, planMix }: CohortHeatmapProps) {
 
 function PlanTriangle({ plan, rows, mix }: { plan: string; rows: CohortRetentionRow[]; mix?: PlanMixRow }) {
   const maxCycle = Math.max(1, ...rows.map((r) => Math.max(0, ...Object.keys(r.retentionByCyclePct).map(Number))));
-  const cycles = Array.from({ length: maxCycle }, (_, i) => i + 1);
+  const cycles = Array.from({ length: maxCycle + 1 }, (_, i) => i);
 
   return (
     <div>

@@ -207,14 +207,18 @@ function SubscriptionsContent({ data }: { data: RawData }) {
       </Card>
 
       <div className="mb-6 grid grid-cols-1 gap-6 lg:grid-cols-2">
-        <Card title="Churn by renewal cycle" subtitle="% of subscribers who cancelled right after reaching each renewal">
+        <Card title="Churn by renewal cycle" subtitle="% of subscribers who didn't renew after their renewal date arrived">
           <p className="mb-3 text-xs text-gray-500">
-            Scoped to subscribers who reached that renewal at least once — a subscriber who cancels{" "}
-            <strong>before ever renewing</strong> never enters this chart at all, no matter which product they were
-            on. That's most of the cancellations right now (91% of all-time cancelled contracts never reached a
-            single renewal), so this chart barely moves when you switch the product filter even though real churn
-            differs a lot by product. For the full picture including day-one cancellations, see{" "}
-            <strong>"Churn: aggregate vs. Bundle-only vs. excluding stockout"</strong> below.
+            "Renewal 0" = cancelled before their first renewal date ever arrived — no charge was attempted yet.
+            "Renewal 1" onward = that cycle's renewal date has come and gone (whether or not the charge on it
+            succeeded — see <strong>cyclesDue</strong> in metricsEngine.ts), so a subscriber whose charge was
+            attempted and failed/was skipped (Appstle's "skipped dunning") but who eventually cancelled now counts as
+            churn at the renewal cycle it actually happened on, instead of disappearing into "never reached a
+            renewal" the way it used to. Under the new definition, 66.7% of all-time cancelled contracts cancelled
+            before their first renewal date ever arrived (Renewal 0) — down from the 91% figure quoted here
+            previously, which conflated "genuinely never got a renewal attempt" with "renewal attempted, failed, and
+            eventually cancelled without ever formally renewing." For the full picture including day-one
+            cancellations, see <strong>"Churn: aggregate vs. Bundle-only vs. excluding stockout"</strong> below.
           </p>
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={churnByCycle}>

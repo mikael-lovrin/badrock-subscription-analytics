@@ -353,21 +353,76 @@ from `buildContracts()`, which groups Appstle-tagged order line items by
   we actually collect," MRR answers "what are we on the hook to deliver
   against." Both KPI cards on the Overview page now carry a hint
   explaining this distinction inline.
-- **Churn by renewal cycle** — cycle 1 = first renewal. Churn at cycle N =
-  contracts whose last successful renewal is N and are now `CANCELLED`,
-  divided by contracts that reached cycle N at all.
+- **Churn by renewal cycle** — cycle 0 = the pre-first-renewal period every
+  contract is born into; cycle 1 = first renewal, and so on. Churn at cycle
+  N = contracts eligible for cycle N that didn't actually renew that many
+  times, divided by contracts eligible for cycle N at all.
+
+  **`cyclesDue` vs. `renewalsReached` (fixed 2026-08-05):** eligibility for
+  cycle N — "has this contract's cycle-N renewal date come up at all" — used
+  to be decided by `renewalsReached >= N`, i.e. *successful* renewals only.
+  That conflated two very different cases under the same "renewalsReached:
+  0" bucket: (1) a subscriber genuinely too new to have hit their first
+  renewal date yet (correctly "aguardando"), and (2) a subscriber whose
+  renewal charge WAS attempted on schedule, failed or got skipped
+  (Appstle's "skipped dunning" — nominally still `ACTIVE`, never actually
+  paid), and who eventually cancelled without a single successful
+  renewal — a resolved, real churn event that the old logic silently
+  dropped out of both `computeChurnByCycle` and `computeCohortRetention`'s
+  denominators entirely, instead of counting it as churn at the cycle it
+  happened on.
+
+  `Contract.cyclesDue` (see its doc comment in `metricsEngine.ts`) fixes
+  this: it's how many full `intervalMonths` periods have elapsed between
+  `createdAt` and the reference date (`cancelledOn` if `CANCELLED`,
+  otherwise now) — i.e. how many renewal dates *should* have come up,
+  independent of whether the charge on each one succeeded. Eligibility for
+  cycle N is now `cyclesDue >= N` (OR'd with `renewalsReached >= N` as a
+  same-day-renewal edge-case guard — see `maturityAtCycle` in
+  `metricsEngine.ts`); `renewalsReached` still decides the *numerator* —
+  whether the outcome was real retention.
+
+  **Real example that exposed the bug:** Nyle Wells
+  (`nyle713@hotmail.com`, contract `appstle::21697429660`, Bedroom Bundle
+  monthly) signed up 2026-05-28. Their 2026-06-28 renewal charge failed and
+  was skipped by Appstle's dunning management (stayed `ACTIVE`, never
+  paid); the 2026-07-28 retry failed again and Appstle marked the contract
+  `CANCELLED`. `renewalsReached` stayed 0 the entire time (never a
+  *successful* renewal), so the old logic treated them as "never reached a
+  renewal" — the same bucket as a brand-new signup — and excluded them from
+  both churn-by-cycle and cohort-retention denominators entirely.
+  `cyclesDue` correctly reads 2 as of the cancellation date (two full
+  monthly renewal windows genuinely came and went), so they're now counted
+  as churn at both cycle 1 and cycle 2 — the correct read, since two
+  renewal charges were attempted on schedule and both failed.
+
+  Recomputed 2026-08-05: **66.7% of all-time cancelled contracts cancelled
+  at "Renewal 0"** (before their first renewal date ever arrived,
+  `cyclesDue === 0`) — replacing the 91% figure quoted before this fix,
+  which used the old `renewalsReached === 0` definition and therefore
+  counted cases like Nyle Wells (a resolved renewal-1/2 churn) as if they'd
+  never had a renewal attempted at all.
 - **Monthly churn** — calendar-month cancellations divided by subscribers
   active at the start of that month. Distinct from churn-by-cycle: this is
   churn on the calendar, not per renewal.
 - **Cohort retention** — contracts grouped by acquisition month × plan (one
   triangle per plan on the site, cadences aren't comparable pooled),
-  reporting what % of that cohort's *resolved* outcomes reached each
-  renewal cycle. Resolved = reached the cycle, or CANCELLED having stalled
-  before reaching it; contracts still ACTIVE with too little elapsed time
-  to have hit that cycle's renewal date are excluded from the denominator
-  (rendered "aguardando" on the heatmap) rather than counted as churn —
-  otherwise a cohort acquired last week reads as mostly-churned just
-  because most of it hasn't had a chance to renew yet.
+  reporting what % of that cohort's *eligible* population (see `cyclesDue`
+  above) actually reached each renewal cycle. "Renewal 0" = survived to see
+  their first renewal date at all (whether or not that first charge
+  succeeded) vs. cancelled before it ever arrived; "Renewal 1" onward =
+  that cycle's renewal date has come and gone, resolved or not, and asks
+  how many of those actually renewed that many times. Contracts still
+  `ACTIVE` with too little elapsed time to have hit that cycle's renewal
+  date (`cyclesDue < N`) are excluded from the denominator (rendered
+  "aguardando" on the heatmap) rather than counted as churn — otherwise a
+  cohort acquired last week reads as mostly-churned just because most of it
+  hasn't had a chance to renew yet. May 2026 monthly cohort, cycle 1,
+  unaffected by this fix (80%, 4/5 matured — Nyle Wells was already being
+  counted there before, since other cohort members had genuinely reached
+  cycle 1); cycle 2 dropped from 66.67% (2/3 matured) to 40% (2/5 matured)
+  once eligibility correctly included Nyle Wells as matured-but-not-reached
+  rather than silently excluded.
 - **LTV** — sum of all charges to date per contract, averaged overall and
   by plan. A live snapshot, not a converged number — it will keep rising
   until every contract in a cohort has eventually cancelled.

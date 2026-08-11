@@ -32,6 +32,7 @@ import {
   computeMonthlyChurn,
   computeMrr,
   computePlanMix,
+  computeRefundsByProduct,
   computeSkippedDunningExposure,
   computeStockoutChurnByProduct,
   filterAppstleSubsByProduct,
@@ -44,9 +45,16 @@ const CHART_TICK_STYLE = { fontSize: 11, fill: "#6b7280" };
 function SubscriptionsContent({ data }: { data: RawData }) {
   const { selectedProducts, dateRange } = useFilters();
 
+  const filters = { products: selectedProducts, dateRange };
+
   const contracts = useMemo(
     () => buildContracts(data.orders, data.lineItems, selectedProducts, data.appstleSubscriptions),
     [data.orders, data.lineItems, selectedProducts, data.appstleSubscriptions],
+  );
+
+  const refundsByProduct = useMemo(
+    () => computeRefundsByProduct(data.orders, data.lineItems, filters),
+    [data.orders, data.lineItems, selectedProducts, dateRange],
   );
 
   // Everything below joins the REAL Appstle ledger, not the Shopify
@@ -266,6 +274,8 @@ function SubscriptionsContent({ data }: { data: RawData }) {
               <th className="py-2 text-right">— refunded</th>
               <th className="py-2 text-right">Pending</th>
               <th className="py-2 text-right">Cancellation rate</th>
+              <th className="py-2 text-right">Refunded orders</th>
+              <th className="py-2 text-right">Refund rate</th>
               <th className="py-2 text-right">Avg LTV</th>
             </tr>
           </thead>
@@ -304,6 +314,13 @@ function SubscriptionsContent({ data }: { data: RawData }) {
                     </span>
                   )}
                 </td>
+                <td
+                  className="py-2 text-right text-gray-500"
+                  title="All orders on this plan's contracts (not just cancelled subscribers' last order) whose payment status came back REFUNDED or PARTIALLY_REFUNDED"
+                >
+                  {formatNumber(row.refundedOrders)}
+                </td>
+                <td className="py-2 text-right">{row.totalPlanOrders > 0 ? formatPercent(row.refundRatePct) : "—"}</td>
                 <td className="py-2 text-right">{row.avgLtv !== null ? formatCurrency(row.avgLtv) : "—"}</td>
               </tr>
             ))}
@@ -424,6 +441,41 @@ function SubscriptionsContent({ data }: { data: RawData }) {
                       style={{ color: row.stockoutSharePct >= 50 ? "#CE202F" : undefined }}
                     >
                       {formatPercent(row.stockoutSharePct)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </Card>
+
+        <Card
+          title="Refunds by product"
+          subtitle="Payment status REFUNDED / PARTIALLY_REFUNDED, all orders (not just subscription contracts) — respects the header's product + date filters, unlike the two cards above"
+        >
+          {refundsByProduct.length === 0 ? (
+            <p className="text-sm text-gray-400">No orders in this scope.</p>
+          ) : (
+            <table className="min-w-full text-sm">
+              <thead>
+                <tr className="border-b border-gray-200 text-left text-xs font-medium uppercase text-gray-500">
+                  <th className="py-2">Product</th>
+                  <th className="py-2 text-right">Orders</th>
+                  <th className="py-2 text-right">Refunded</th>
+                  <th className="py-2 text-right">Refund rate</th>
+                </tr>
+              </thead>
+              <tbody>
+                {refundsByProduct.map((row) => (
+                  <tr key={row.product} className="border-b border-gray-100">
+                    <td className="py-2 font-medium text-gray-900">{row.product}</td>
+                    <td className="py-2 text-right">{formatNumber(row.totalOrders)}</td>
+                    <td className="py-2 text-right">{formatNumber(row.refundedOrders)}</td>
+                    <td
+                      className="py-2 text-right font-semibold"
+                      style={{ color: row.refundRatePct >= 10 ? "#CE202F" : undefined }}
+                    >
+                      {formatPercent(row.refundRatePct)}
                     </td>
                   </tr>
                 ))}

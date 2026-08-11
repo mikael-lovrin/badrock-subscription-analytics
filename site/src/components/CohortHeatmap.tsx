@@ -1,5 +1,5 @@
 import type { CohortRetentionRow, PlanMixRow } from "../lib/metricsEngine";
-import { formatPlanLabel } from "../lib/format";
+import { formatNumber, formatPercent, formatPlanLabel } from "../lib/format";
 
 interface CohortHeatmapProps {
   rows: CohortRetentionRow[];
@@ -65,6 +65,7 @@ function PlanTriangle({ plan, rows, mix }: { plan: string; rows: CohortRetention
             <tr>
               <th className="sticky left-0 bg-white px-2 py-2 text-left font-medium text-gray-500">Cohort</th>
               <th className="px-2 py-2 text-right font-medium text-gray-500">Size</th>
+              <th className="px-2 py-2 text-right font-medium text-gray-500">Refunds</th>
               {cycles.map((c) => (
                 <th key={c} className="px-2 py-2 text-center font-medium text-gray-500">
                   Renewal {c}
@@ -77,6 +78,12 @@ function PlanTriangle({ plan, rows, mix }: { plan: string; rows: CohortRetention
               <tr key={row.cohortMonth} className="border-t border-gray-100">
                 <td className="sticky left-0 bg-white px-2 py-2 font-medium text-gray-900">{row.cohortMonth}</td>
                 <td className="px-2 py-2 text-right text-gray-600">{row.cohortSize}</td>
+                <td
+                  className="px-2 py-2 text-right text-gray-600"
+                  title={`${formatNumber(row.refundedOrdersCount)} de ${formatNumber(row.cohortOrdersCount)} pedidos deste cohort vieram REFUNDED/PARTIALLY_REFUNDED`}
+                >
+                  {row.cohortOrdersCount > 0 ? `${formatNumber(row.refundedOrdersCount)} (${formatPercent(row.refundRatePct)})` : "—"}
+                </td>
                 {cycles.map((c) => {
                   const pct = row.retentionByCyclePct[c];
                   const matured = row.maturedByCycle[c];

@@ -107,6 +107,76 @@ export function computeRevenueSummary(orders: RawOrder[], lineItems: RawLineItem
   };
 }
 
+export interface RefundSummary {
+  totalOrders: number;
+  refundedOrders: number;
+  refundRatePct: number;
+}
+
+/**
+ * Refund count and rate at the raw-order level. "Refunded" here is the
+ * order's own Shopify payment status (`financial_status` REFUNDED/
+ * PARTIALLY_REFUNDED — see REFUNDED_STATUSES below) confirmed with Mikael
+ * as the ground truth (2026-08-12): there's no separate order tag for this,
+ * it's the same payment-status field `Contract.lastOrderRefunded` and
+ * `PlanMixRow`'s refund columns already key off. Respects the same
+ * product + date-range filter as computeRevenueSummary.
+ */
+export function computeRefundSummary(orders: RawOrder[], lineItems: RawLineItem[], filters: Filters): RefundSummary {
+  const orders_ = filteredOrders(orders, lineItems, filters);
+  const refundedOrders = orders_.filter((o) => REFUNDED_STATUSES.has(o.financial_status)).length;
+  return {
+    totalOrders: orders_.length,
+    refundedOrders,
+    refundRatePct: orders_.length ? round2((100 * refundedOrders) / orders_.length) : 0,
+  };
+}
+
+export interface ProductRefundRow {
+  product: string;
+  totalOrders: number;
+  refundedOrders: number;
+  refundRatePct: number;
+}
+
+/**
+ * Per-product breakdown of the same refund signal as computeRefundSummary,
+ * segmented the way computeStockoutChurnByProduct segments cancellations.
+ * An order touching more than one product counts toward every product it
+ * touches (matches computeTopProducts' per-line-item grouping above).
+ */
+export function computeRefundsByProduct(orders: RawOrder[], lineItems: RawLineItem[], filters: Filters): ProductRefundRow[] {
+  const orders_ = filteredOrders(orders, lineItems, filters);
+  const orderIds = new Set(orders_.map((o) => o.id));
+  const productsByOrder = new Map<string, Set<string>>();
+  for (const li of lineItems) {
+    if (!orderIds.has(li.order_id) || li.product === null) continue;
+    const set = productsByOrder.get(li.order_id) ?? new Set<string>();
+    set.add(li.product);
+    productsByOrder.set(li.order_id, set);
+  }
+  const byProduct = new Map<string, { total: number; refunded: number }>();
+  for (const o of orders_) {
+    const products = productsByOrder.get(o.id);
+    if (!products) continue;
+    const isRefunded = REFUNDED_STATUSES.has(o.financial_status);
+    for (const product of products) {
+      const bucket = byProduct.get(product) ?? { total: 0, refunded: 0 };
+      bucket.total += 1;
+      if (isRefunded) bucket.refunded += 1;
+      byProduct.set(product, bucket);
+    }
+  }
+  return [...byProduct.entries()]
+    .map(([product, b]) => ({
+      product,
+      totalOrders: b.total,
+      refundedOrders: b.refunded,
+      refundRatePct: b.total ? round2((100 * b.refunded) / b.total) : 0,
+    }))
+    .sort((a, b) => b.refundedOrders - a.refundedOrders);
+}
+
 export interface DailyPoint {
   date: string; // YYYY-MM-DD
   label: string; // DD-MM
@@ -919,6 +989,17 @@ export interface CohortRetentionRow {
   maturedByCycle: Record<number, number>;
   /** Numerator behind retentionByCyclePct — exposed so the UI can show the exact "reached/matured" fraction instead of just the rounded %. */
   reachedByCycle: Record<number, number>;
+  /**
+   * Refund signal for this cohort (added 2026-08-12): how many of this
+   * cohort's orders (every contract's every billing event, not just the
+   * first) came back REFUNDED/PARTIALLY_REFUNDED, out of the cohort's
+   * total order count so far — same REFUNDED_STATUSES payment-status
+   * signal as computeRefundSummary/PlanMixRow, just grouped by acquisition
+   * month × plan instead of flat or plan-only.
+   */
+  refundedOrdersCount: number;
+  cohortOrdersCount: number;
+  refundRatePct: number;
 }
 
 export function computeCohortRetention(contracts: Contract[], dateRange: DateRange, maxCycle = 12): CohortRetentionRow[] {
@@ -943,7 +1024,20 @@ export function computeCohortRetention(contracts: Contract[], dateRange: DateRan
       reachedByCycle[cycle] = reached;
       retentionByCyclePct[cycle] = round2((100 * reached) / matured);
     }
-    rows.push({ cohortMonth, plan, cohortSize: group.length, retentionByCyclePct, maturedByCycle, reachedByCycle });
+    const cohortEvents = group.flatMap((c) => c.events);
+    const refundedOrdersCount = cohortEvents.filter((e) => REFUNDED_STATUSES.has(e.financialStatus)).length;
+    const cohortOrdersCount = cohortEvents.length;
+    rows.push({
+      cohortMonth,
+      plan,
+      cohortSize: group.length,
+      retentionByCyclePct,
+      maturedByCycle,
+      reachedByCycle,
+      refundedOrdersCount,
+      cohortOrdersCount,
+      refundRatePct: cohortOrdersCount ? round2((100 * refundedOrdersCount) / cohortOrdersCount) : 0,
+    });
   }
   return rows;
 }
@@ -1011,6 +1105,15 @@ export interface PlanMixRow {
   cancelledRefunded: number;
   cancelledSilent: number;
   refundShareOfCancelledPct: number;
+  /**
+   * Refund signal across ALL of this plan's orders (added 2026-08-12), not
+   * just cancelled subscribers' last order like cancelledRefunded above —
+   * same REFUNDED_STATUSES payment-status signal, segmented by plan the
+   * same way cancellation already is here.
+   */
+  refundedOrders: number;
+  totalPlanOrders: number;
+  refundRatePct: number;
   avgLtv: number | null;
 }
 
@@ -1038,6 +1141,8 @@ export function computePlanMix(contracts: Contract[], dateRange: DateRange): Pla
       const cancelledRefunded = cancelledContracts.filter((c) => c.lastOrderRefunded).length;
       const cancelledSilent = cancelledContracts.length - cancelledRefunded;
       const ltvValues = group.map((c) => c.lifetimeValue);
+      const planEvents = group.flatMap((c) => c.events);
+      const refundedOrders = planEvents.filter((e) => REFUNDED_STATUSES.has(e.financialStatus)).length;
       return {
         plan,
         totalSubscribers: group.length,
@@ -1048,6 +1153,9 @@ export function computePlanMix(contracts: Contract[], dateRange: DateRange): Pla
         cancelledRefunded,
         cancelledSilent,
         refundShareOfCancelledPct: cancelled ? round2((100 * cancelledRefunded) / cancelled) : 0,
+        refundedOrders,
+        totalPlanOrders: planEvents.length,
+        refundRatePct: planEvents.length ? round2((100 * refundedOrders) / planEvents.length) : 0,
         avgLtv: ltvValues.length ? round2(avg(ltvValues)) : null,
       };
     });

@@ -32,9 +32,26 @@ _KNOWN_TEST_EMAILS = {
 _INTERNAL_DOMAINS = {"grupofeg.com", "crearite.com.br"}
 
 
-def is_test_order(total_price: float, email: str | None, first_name: str | None, last_name: str | None) -> str | None:
+def is_test_order(
+    total_price: float,
+    email: str | None,
+    first_name: str | None,
+    last_name: str | None,
+    tags: set[str] | None = None,
+) -> str | None:
     """Returns a reason string if the order looks like internal testing
-    noise rather than a real customer order, else None."""
+    noise rather than a real customer order, else None.
+
+    `tags` (order-level Shopify tags, already lowercased by the caller) is
+    optional so callers without a tags concept (e.g. appstle_csv.py's CSV
+    rows) can keep calling this unchanged. Since 2026-08-12, the product
+    team tags real test purchases with `TESTE` directly on the order —
+    checked first, ahead of the older heuristics below, since it's an
+    explicit signal rather than an inference.
+    """
+    if tags and "teste" in tags:
+        return "tag_teste"
+
     if total_price in _TEST_AMOUNTS:
         return f"test_amount_{total_price}"
 
@@ -223,15 +240,14 @@ def orders_and_line_items_from_shopify(
         customer = node.get("customer") or {}
         address = customer.get("defaultAddress") or {}
         total_price = float(node["currentTotalPriceSet"]["shopMoney"]["amount"])
+        tags = {t.lower() for t in node.get("tags", [])}
 
         reason = is_test_order(
-            total_price, customer.get("email"), customer.get("firstName"), customer.get("lastName")
+            total_price, customer.get("email"), customer.get("firstName"), customer.get("lastName"), tags
         )
         if reason:
             removed += 1
             continue
-
-        tags = {t.lower() for t in node.get("tags", [])}
 
         order_rows.append(
             {

@@ -135,9 +135,12 @@ ledger:
   fallback, not the primary source, despite being the only one that
   works without any manual step.
 - Internal test orders (known staff emails/domains, `teste`/`test` in the
-  name, or suspiciously low totals like $0/$1/$5) are filtered out before
-  anything else — see `etl/load.py`'s `is_test_order()`, reused as-is by
-  `etl/appstle_csv.py` for the CSV path.
+  name, suspiciously low totals like $0/$1/$5, or — since 2026-08-12 — the
+  order carrying a `TESTE` tag, now added directly by the product team on
+  test purchases and checked first, ahead of the older heuristics) are
+  filtered out before anything else — see `etl/load.py`'s `is_test_order()`,
+  reused as-is by `etl/appstle_csv.py` for the CSV path (the CSV export has
+  no tags field, so that caller only ever gets the older heuristics).
 
 If Badrock's Appstle plan is ever upgraded to include full API access,
 this whole Shopify-inference fallback can be retired in favor of always
@@ -426,6 +429,25 @@ from `buildContracts()`, which groups Appstle-tagged order line items by
 - **LTV** — sum of all charges to date per contract, averaged overall and
   by plan. A live snapshot, not a converged number — it will keep rising
   until every contract in a cohort has eventually cancelled.
+- **Refunds (added 2026-08-12)** — confirmed with Mikael that "the refunded
+  tag on the payment" is the order's own Shopify `displayFinancialStatus`
+  (REFUNDED / PARTIALLY_REFUNDED — `REFUNDED_STATUSES` in
+  `metricsEngine.ts`), the same payment-status signal `Contract.lastOrderRefunded`
+  and the Plan comparison table's `— refunded` column already used — not a
+  separate order tag. Four new views, all keying off that same signal:
+  - `computeRefundSummary` — global count + rate over total orders
+    (Overview page KPIs), respecting the header's product + date filters.
+  - `computeRefundsByProduct` — same signal, segmented by product
+    (Subscriptions page, "Refunds by product" card), mirroring
+    `computeStockoutChurnByProduct`'s per-product cancellation breakdown.
+  - `PlanMixRow.refundedOrders` / `refundRatePct` — segmented by plan
+    (Subscriptions page, "Plan comparison" table), across ALL of that
+    plan's orders — broader than the existing `cancelledRefunded` column,
+    which only looks at a cancelled subscriber's very last order.
+  - `CohortRetentionRow.refundedOrdersCount` / `refundRatePct` — segmented
+    by acquisition month × plan (Subscriptions page, "Cohort retention"
+    heatmap's new "Refunds" column), same grouping as the retention
+    triangle itself.
 
 The product filter (multi-select) and date-range filter apply everywhere:
 product filtering restricts which contracts/orders are considered at all;

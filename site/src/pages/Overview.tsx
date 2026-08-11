@@ -6,7 +6,7 @@ import { KpiCard } from "../components/KpiCard";
 import { PageHeader } from "../components/PageHeader";
 import { useFilters } from "../lib/FilterContext";
 import { formatCurrency, formatNumber, formatPercent } from "../lib/format";
-import { buildContracts, computeMrr, computeRevenueSummary, computeRevenueTrend } from "../lib/metricsEngine";
+import { buildContracts, computeMrr, computeRefundSummary, computeRevenueSummary, computeRevenueTrend } from "../lib/metricsEngine";
 import type { RawData } from "../lib/useRawData";
 
 const CHART_TICK_STYLE = { fontSize: 11, fill: "#6b7280" };
@@ -16,6 +16,7 @@ function OverviewContent({ data }: { data: RawData }) {
   const filters = { products: selectedProducts, dateRange };
 
   const summary = useMemo(() => computeRevenueSummary(data.orders, data.lineItems, filters), [data, selectedProducts, dateRange]);
+  const refundSummary = useMemo(() => computeRefundSummary(data.orders, data.lineItems, filters), [data, selectedProducts, dateRange]);
   const trend = useMemo(() => computeRevenueTrend(data.orders, data.lineItems, filters), [data, selectedProducts, dateRange]);
   const contracts = useMemo(
     () => buildContracts(data.orders, data.lineItems, selectedProducts, data.appstleSubscriptions),
@@ -39,6 +40,19 @@ function OverviewContent({ data }: { data: RawData }) {
           label="MRR"
           value={formatCurrency(mrr.totalMrr)}
           hint="Committed recurring rate, not cash collected — intentionally unaffected by skipped-dunning cycles. See Subscriptions for the full breakdown and the skipped-dunning exposure view."
+        />
+      </div>
+
+      <div className="mb-6 grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <KpiCard
+          label="Refunds"
+          value={formatNumber(refundSummary.refundedOrders)}
+          hint="Orders whose payment status came back REFUNDED or PARTIALLY_REFUNDED"
+        />
+        <KpiCard
+          label="Refund rate"
+          value={formatPercent(refundSummary.refundRatePct)}
+          hint={`${refundSummary.refundedOrders} of ${refundSummary.totalOrders} orders in this scope`}
         />
       </div>
 

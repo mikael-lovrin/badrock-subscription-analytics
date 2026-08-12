@@ -80,7 +80,7 @@ function PlanTriangle({ plan, rows, mix }: { plan: string; rows: CohortRetention
                 <td className="px-2 py-2 text-right text-gray-600">{row.cohortSize}</td>
                 <td
                   className="px-2 py-2 text-right text-gray-600"
-                  title={`${formatNumber(row.refundedOrdersCount)} de ${formatNumber(row.cohortOrdersCount)} pedidos deste cohort vieram REFUNDED/PARTIALLY_REFUNDED`}
+                  title={`${formatNumber(row.refundedOrdersCount)} de ${formatNumber(row.cohortOrdersCount)} assinaturas deste cohort tiveram a PRIMEIRA compra REFUNDED/PARTIALLY_REFUNDED (renovação reembolsada conta como churn no ciclo, não aqui)`}
                 >
                   {row.cohortOrdersCount > 0 ? `${formatNumber(row.refundedOrdersCount)} (${formatPercent(row.refundRatePct)})` : "—"}
                 </td>

@@ -284,8 +284,6 @@ function SubscriptionsContent({ data }: { data: RawData }) {
               <th className="py-2 text-right">— refunded</th>
               <th className="py-2 text-right">Pending</th>
               <th className="py-2 text-right">Cancellation rate</th>
-              <th className="py-2 text-right">Refunded orders</th>
-              <th className="py-2 text-right">Refund rate</th>
               <th className="py-2 text-right">Subscriptions refunded</th>
               <th className="py-2 text-right">Avg LTV</th>
             </tr>
@@ -327,14 +325,7 @@ function SubscriptionsContent({ data }: { data: RawData }) {
                 </td>
                 <td
                   className="py-2 text-right text-gray-500"
-                  title="All orders on this plan's contracts (not just cancelled subscribers' last order) whose payment status came back REFUNDED or PARTIALLY_REFUNDED"
-                >
-                  {formatNumber(row.refundedOrders)}
-                </td>
-                <td className="py-2 text-right">{row.totalPlanOrders > 0 ? formatPercent(row.refundRatePct) : "—"}</td>
-                <td
-                  className="py-2 text-right text-gray-500"
-                  title="Of this plan's subscriptions, how many had their FIRST order (not a renewal) come back REFUNDED/PARTIALLY_REFUNDED"
+                  title="Of this plan's subscriptions, how many had their FIRST order (not a renewal) come back REFUNDED/PARTIALLY_REFUNDED — a refunded renewal counts as churn at that cycle instead, not here"
                 >
                   {row.totalSubscribers > 0
                     ? `${formatNumber(row.subscriptionsRefunded)} (${formatPercent(row.subscriptionRefundRatePct)})`
@@ -470,7 +461,7 @@ function SubscriptionsContent({ data }: { data: RawData }) {
 
         <Card
           title="Refunds by product"
-          subtitle="Payment status REFUNDED / PARTIALLY_REFUNDED, all orders (not just subscription contracts) — respects the header's product + date filters, unlike the two cards above"
+          subtitle="Payment status REFUNDED / PARTIALLY_REFUNDED, non-recurring orders only (first-time purchases — renewal/recurring charges excluded, not just subscription contracts) — respects the header's product + date filters, unlike the two cards above"
         >
           {refundsByProduct.length === 0 ? (
             <p className="text-sm text-gray-400">No orders in this scope.</p>

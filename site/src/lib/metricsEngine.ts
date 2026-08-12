@@ -114,16 +114,34 @@ export interface RefundSummary {
 }
 
 /**
- * Refund count and rate at the raw-order level. "Refunded" here is the
- * order's own Shopify payment status (`financial_status` REFUNDED/
- * PARTIALLY_REFUNDED — see REFUNDED_STATUSES below) confirmed with Mikael
- * as the ground truth (2026-08-12): there's no separate order tag for this,
- * it's the same payment-status field `Contract.lastOrderRefunded` and
- * `PlanMixRow`'s refund columns already key off. Respects the same
- * product + date-range filter as computeRevenueSummary.
+ * Renewal/recurring charges (Appstle's `appstle_subscription_recurring_order`
+ * tag) excluded from both sides of every order-level refund comparison in
+ * this file — added 2026-08-13 per Mikael: blending first-time orders
+ * (one-off purchases + a subscription's opening charge) with renewal
+ * charges in the same denominator isn't a coherent comparison, since a
+ * refunded renewal is really a churn event at that cycle (see
+ * Contract.firstOrderRefunded/computeSubscriptionRefundSummary), not the
+ * same kind of "did this purchase get refunded" question a first-time
+ * order answers. Keeps first-time subscription orders AND plain
+ * non-subscription orders (neither tag set) — excludes only orders
+ * actually tagged as a renewal.
+ */
+function excludeRecurring(orders: RawOrder[]): RawOrder[] {
+  return orders.filter((o) => !o.is_appstle_recurring_order);
+}
+
+/**
+ * Refund count and rate at the raw-order level, scoped to non-recurring
+ * orders only (see excludeRecurring). "Refunded" here is the order's own
+ * Shopify payment status (`financial_status` REFUNDED/PARTIALLY_REFUNDED —
+ * see REFUNDED_STATUSES below) confirmed with Mikael as the ground truth
+ * (2026-08-12): there's no separate order tag for this, it's the same
+ * payment-status field `Contract.lastOrderRefunded` and `PlanMixRow`'s
+ * refund columns already key off. Respects the same product + date-range
+ * filter as computeRevenueSummary.
  */
 export function computeRefundSummary(orders: RawOrder[], lineItems: RawLineItem[], filters: Filters): RefundSummary {
-  const orders_ = filteredOrders(orders, lineItems, filters);
+  const orders_ = excludeRecurring(filteredOrders(orders, lineItems, filters));
   const refundedOrders = orders_.filter((o) => REFUNDED_STATUSES.has(o.financial_status)).length;
   return {
     totalOrders: orders_.length,
@@ -141,12 +159,13 @@ export interface ProductRefundRow {
 
 /**
  * Per-product breakdown of the same refund signal as computeRefundSummary,
- * segmented the way computeStockoutChurnByProduct segments cancellations.
- * An order touching more than one product counts toward every product it
- * touches (matches computeTopProducts' per-line-item grouping above).
+ * segmented the way computeStockoutChurnByProduct segments cancellations —
+ * also scoped to non-recurring orders only (see excludeRecurring). An order
+ * touching more than one product counts toward every product it touches
+ * (matches computeTopProducts' per-line-item grouping above).
  */
 export function computeRefundsByProduct(orders: RawOrder[], lineItems: RawLineItem[], filters: Filters): ProductRefundRow[] {
-  const orders_ = filteredOrders(orders, lineItems, filters);
+  const orders_ = excludeRecurring(filteredOrders(orders, lineItems, filters));
   const orderIds = new Set(orders_.map((o) => o.id));
   const productsByOrder = new Map<string, Set<string>>();
   for (const li of lineItems) {
@@ -1010,12 +1029,14 @@ export interface CohortRetentionRow {
   /** Numerator behind retentionByCyclePct — exposed so the UI can show the exact "reached/matured" fraction instead of just the rounded %. */
   reachedByCycle: Record<number, number>;
   /**
-   * Refund signal for this cohort (added 2026-08-12): how many of this
-   * cohort's orders (every contract's every billing event, not just the
-   * first) came back REFUNDED/PARTIALLY_REFUNDED, out of the cohort's
-   * total order count so far — same REFUNDED_STATUSES payment-status
-   * signal as computeRefundSummary/PlanMixRow, just grouped by acquisition
-   * month × plan instead of flat or plan-only.
+   * Refund signal for this cohort: how many of this cohort's
+   * subscriptions had their FIRST order come back REFUNDED/
+   * PARTIALLY_REFUNDED, out of the cohort's total subscription count —
+   * same Contract.firstOrderRefunded signal as computeSubscriptionRefundSummary/
+   * PlanMixRow's subscriptionsRefunded, grouped by acquisition month × plan
+   * instead of flat or plan-only. Deliberately excludes renewal/recurring
+   * charges (updated 2026-08-13, see excludeRecurring's doc comment) — a
+   * refunded renewal is a churn event at that cycle, not counted here.
    */
   refundedOrdersCount: number;
   cohortOrdersCount: number;
@@ -1044,9 +1065,8 @@ export function computeCohortRetention(contracts: Contract[], dateRange: DateRan
       reachedByCycle[cycle] = reached;
       retentionByCyclePct[cycle] = round2((100 * reached) / matured);
     }
-    const cohortEvents = group.flatMap((c) => c.events);
-    const refundedOrdersCount = cohortEvents.filter((e) => REFUNDED_STATUSES.has(e.financialStatus)).length;
-    const cohortOrdersCount = cohortEvents.length;
+    const refundedOrdersCount = group.filter((c) => c.firstOrderRefunded).length;
+    const cohortOrdersCount = group.length;
     rows.push({
       cohortMonth,
       plan,
@@ -1126,21 +1146,16 @@ export interface PlanMixRow {
   cancelledSilent: number;
   refundShareOfCancelledPct: number;
   /**
-   * Refund signal across ALL of this plan's orders (added 2026-08-12), not
-   * just cancelled subscribers' last order like cancelledRefunded above —
-   * same REFUNDED_STATUSES payment-status signal, segmented by plan the
-   * same way cancellation already is here.
-   */
-  refundedOrders: number;
-  totalPlanOrders: number;
-  refundRatePct: number;
-  /**
-   * Subscription-level refund count for this plan (added 2026-08-12): of
-   * this plan's subscribers, how many had their FIRST order come back
-   * refunded — see Contract.firstOrderRefunded's doc comment for why this
-   * is scoped to the first order only, unlike refundedOrders above (all
-   * orders, including renewals) or cancelledRefunded above (last order,
-   * whichever cycle it happened to be).
+   * Subscription-level refund count for this plan: of this plan's
+   * subscribers, how many had their FIRST order come back refunded — see
+   * Contract.firstOrderRefunded's doc comment for why this is scoped to
+   * the first order only, and excludeRecurring's doc comment for why a
+   * refunded renewal doesn't belong in this count at all (updated
+   * 2026-08-13; used to also expose a separate refundedOrders/
+   * totalPlanOrders pair counting every event including renewals, dropped
+   * because once renewals are excluded it's numerically identical to this
+   * field, just under a different name — kept the one whose name says what
+   * it means).
    */
   subscriptionsRefunded: number;
   subscriptionRefundRatePct: number;
@@ -1195,8 +1210,6 @@ export function computePlanMix(contracts: Contract[], dateRange: DateRange): Pla
       const cancelledRefunded = cancelledContracts.filter((c) => c.lastOrderRefunded).length;
       const cancelledSilent = cancelledContracts.length - cancelledRefunded;
       const ltvValues = group.map((c) => c.lifetimeValue);
-      const planEvents = group.flatMap((c) => c.events);
-      const refundedOrders = planEvents.filter((e) => REFUNDED_STATUSES.has(e.financialStatus)).length;
       const subscriptionsRefunded = group.filter((c) => c.firstOrderRefunded).length;
       return {
         plan,
@@ -1208,9 +1221,6 @@ export function computePlanMix(contracts: Contract[], dateRange: DateRange): Pla
         cancelledRefunded,
         cancelledSilent,
         refundShareOfCancelledPct: cancelled ? round2((100 * cancelledRefunded) / cancelled) : 0,
-        refundedOrders,
-        totalPlanOrders: planEvents.length,
-        refundRatePct: planEvents.length ? round2((100 * refundedOrders) / planEvents.length) : 0,
         subscriptionsRefunded,
         subscriptionRefundRatePct: group.length ? round2((100 * subscriptionsRefunded) / group.length) : 0,
         avgLtv: ltvValues.length ? round2(avg(ltvValues)) : null,

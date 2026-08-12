@@ -47,12 +47,12 @@ function OverviewContent({ data }: { data: RawData }) {
         <KpiCard
           label="Refunds"
           value={formatNumber(refundSummary.refundedOrders)}
-          hint="Orders whose payment status came back REFUNDED or PARTIALLY_REFUNDED"
+          hint="Non-recurring orders (first-time purchases, excludes renewal charges) whose payment status came back REFUNDED or PARTIALLY_REFUNDED"
         />
         <KpiCard
           label="Refund rate"
           value={formatPercent(refundSummary.refundRatePct)}
-          hint={`${refundSummary.refundedOrders} of ${refundSummary.totalOrders} orders in this scope`}
+          hint={`${refundSummary.refundedOrders} of ${refundSummary.totalOrders} non-recurring orders in this scope — renewal charges excluded, see Subscriptions for those`}
         />
       </div>
 

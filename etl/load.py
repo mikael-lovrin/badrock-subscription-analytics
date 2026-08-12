@@ -240,10 +240,17 @@ def orders_and_line_items_from_shopify(
         customer = node.get("customer") or {}
         address = customer.get("defaultAddress") or {}
         total_price = float(node["currentTotalPriceSet"]["shopMoney"]["amount"])
+        original_total_price = float(node["totalPriceSet"]["shopMoney"]["amount"])
         tags = {t.lower() for t in node.get("tags", [])}
 
+        # The test-amount heuristic must run against the order's original
+        # (pre-refund) total, not currentTotalPriceSet — a fully refunded
+        # order has currentTotalPrice 0.0, which would otherwise match
+        # _TEST_AMOUNTS and silently drop every fully-refunded real order
+        # from the dataset (discovered 2026-08-12: Mikael saw far more
+        # refunds in Shopify Admin than the site reported).
         reason = is_test_order(
-            total_price, customer.get("email"), customer.get("firstName"), customer.get("lastName"), tags
+            original_total_price, customer.get("email"), customer.get("firstName"), customer.get("lastName"), tags
         )
         if reason:
             removed += 1

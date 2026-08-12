@@ -96,6 +96,7 @@ class ShopifyClient:
                 displayFinancialStatus
                 tags
                 currentTotalPriceSet { shopMoney { amount } }
+                totalPriceSet { shopMoney { amount } }
                 customer {
                   id
                   email

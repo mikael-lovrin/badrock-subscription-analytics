@@ -35,6 +35,7 @@ import {
   computeRefundsByProduct,
   computeSkippedDunningExposure,
   computeStockoutChurnByProduct,
+  computeSubscriptionRefundSummary,
   filterAppstleSubsByProduct,
   filterBillingEventsByProduct,
 } from "../lib/metricsEngine";
@@ -112,6 +113,10 @@ function SubscriptionsContent({ data }: { data: RawData }) {
   const ltv = useMemo(() => computeLtv(contracts, dateRange), [contracts, dateRange]);
   const avgLifespan = useMemo(() => computeAvgLifespan(contracts, dateRange), [contracts, dateRange]);
   const planMix = useMemo(() => computePlanMix(contracts, dateRange), [contracts, dateRange]);
+  const subscriptionRefundSummary = useMemo(
+    () => computeSubscriptionRefundSummary(contracts, dateRange),
+    [contracts, dateRange],
+  );
 
   const totalSubscribers = planMix.reduce((sum, p) => sum + p.totalSubscribers, 0);
   const totalCancelled = planMix.reduce((sum, p) => sum + p.cancelledSubscribers, 0);
@@ -160,6 +165,11 @@ function SubscriptionsContent({ data }: { data: RawData }) {
           label="Cancellation rate"
           value={formatPercent(totalMatured ? (100 * totalCancelled) / totalMatured : 0)}
           hint={`Of ${totalMatured} subscribers past their first renewal deadline (${totalSubscribers - totalMatured} too new to count yet)`}
+        />
+        <KpiCard
+          label="Subscriptions refunded"
+          value={formatNumber(subscriptionRefundSummary.refundedSubscriptions)}
+          hint={`${formatPercent(subscriptionRefundSummary.refundRatePct)} of ${subscriptionRefundSummary.totalSubscriptions} subscriptions — counts a refund only when it hit the FIRST order. A renewal that got refunded after cancellation counts as churn at that cycle instead (see "Churn by renewal cycle" below), not here.`}
         />
       </div>
 
@@ -276,6 +286,7 @@ function SubscriptionsContent({ data }: { data: RawData }) {
               <th className="py-2 text-right">Cancellation rate</th>
               <th className="py-2 text-right">Refunded orders</th>
               <th className="py-2 text-right">Refund rate</th>
+              <th className="py-2 text-right">Subscriptions refunded</th>
               <th className="py-2 text-right">Avg LTV</th>
             </tr>
           </thead>
@@ -321,6 +332,14 @@ function SubscriptionsContent({ data }: { data: RawData }) {
                   {formatNumber(row.refundedOrders)}
                 </td>
                 <td className="py-2 text-right">{row.totalPlanOrders > 0 ? formatPercent(row.refundRatePct) : "—"}</td>
+                <td
+                  className="py-2 text-right text-gray-500"
+                  title="Of this plan's subscriptions, how many had their FIRST order (not a renewal) come back REFUNDED/PARTIALLY_REFUNDED"
+                >
+                  {row.totalSubscribers > 0
+                    ? `${formatNumber(row.subscriptionsRefunded)} (${formatPercent(row.subscriptionRefundRatePct)})`
+                    : "—"}
+                </td>
                 <td className="py-2 text-right">{row.avgLtv !== null ? formatCurrency(row.avgLtv) : "—"}</td>
               </tr>
             ))}

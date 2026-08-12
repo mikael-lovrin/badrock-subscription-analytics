@@ -469,6 +469,22 @@ export interface Contract {
    * why they eventually stopped.
    */
   lastOrderRefunded: boolean;
+  /**
+   * Whether the FIRST order on this contract (the one that started the
+   * subscription) came back REFUNDED or PARTIALLY_REFUNDED — added
+   * 2026-08-12 as the definition of "this subscription was refunded" per
+   * Mikael: only a refund on the initial purchase counts here. If instead
+   * a RENEWAL charge gets refunded after the subscriber cancels, that's
+   * not a "subscription refund" — it's ordinary churn at whatever cycle
+   * the cancellation happened on (already captured correctly by
+   * renewalsReached/cyclesDue and computeChurnByCycle, independent of
+   * financial_status), so it deliberately does NOT feed this field. Not to
+   * be confused with `lastOrderRefunded`, which looks at whichever order
+   * was last (could be the same order for a never-renewed contract, or a
+   * later renewal) and answers a different question ("did the order that
+   * ended this contract come back refunded").
+   */
+  firstOrderRefunded: boolean;
 }
 
 /**
@@ -663,6 +679,9 @@ function synthesizeContractFromAppstleSub(sub: RawAppstleSubscription, now: Date
     renewalsReached: Math.max(0, (sub.cycles ?? 1) - 1),
     cyclesDue: computeCyclesDue(createdAt, sub.interval_months, referenceDate),
     lastOrderRefunded: false,
+    // No Shopify financial_status exists for a synthesized contract (see
+    // this function's doc comment) — no basis to claim a refund happened.
+    firstOrderRefunded: false,
   };
 }
 
@@ -778,6 +797,7 @@ export function buildContracts(
         renewalsReached: contractEvents.length - 1,
         cyclesDue: computeCyclesDue(contractEvents[0].date, intervalMonths, cyclesDueReferenceDate),
         lastOrderRefunded: REFUNDED_STATUSES.has(last.financialStatus),
+        firstOrderRefunded: REFUNDED_STATUSES.has(contractEvents[0].financialStatus),
       });
 
       if (email) coveredEmailProductKeys.add(`${email.toLowerCase()}::${last.product}`);
@@ -1114,7 +1134,41 @@ export interface PlanMixRow {
   refundedOrders: number;
   totalPlanOrders: number;
   refundRatePct: number;
+  /**
+   * Subscription-level refund count for this plan (added 2026-08-12): of
+   * this plan's subscribers, how many had their FIRST order come back
+   * refunded — see Contract.firstOrderRefunded's doc comment for why this
+   * is scoped to the first order only, unlike refundedOrders above (all
+   * orders, including renewals) or cancelledRefunded above (last order,
+   * whichever cycle it happened to be).
+   */
+  subscriptionsRefunded: number;
+  subscriptionRefundRatePct: number;
   avgLtv: number | null;
+}
+
+/**
+ * Subscription-level refund count/rate ("how many subscriptions did we
+ * refund", not "how many orders") — see Contract.firstOrderRefunded's doc
+ * comment. Scoped to the acquisition-date cohort like the rest of the
+ * Contract-based metrics in this file (computePlanMix, computeLtv, etc.);
+ * product scope comes from whatever contracts were already built with (see
+ * buildContracts' `products` param).
+ */
+export interface SubscriptionRefundSummary {
+  totalSubscriptions: number;
+  refundedSubscriptions: number;
+  refundRatePct: number;
+}
+
+export function computeSubscriptionRefundSummary(contracts: Contract[], dateRange: DateRange): SubscriptionRefundSummary {
+  const cohort = contractsInCohortRange(contracts, dateRange);
+  const refundedSubscriptions = cohort.filter((c) => c.firstOrderRefunded).length;
+  return {
+    totalSubscriptions: cohort.length,
+    refundedSubscriptions,
+    refundRatePct: cohort.length ? round2((100 * refundedSubscriptions) / cohort.length) : 0,
+  };
 }
 
 export function computePlanMix(contracts: Contract[], dateRange: DateRange): PlanMixRow[] {
@@ -1143,6 +1197,7 @@ export function computePlanMix(contracts: Contract[], dateRange: DateRange): Pla
       const ltvValues = group.map((c) => c.lifetimeValue);
       const planEvents = group.flatMap((c) => c.events);
       const refundedOrders = planEvents.filter((e) => REFUNDED_STATUSES.has(e.financialStatus)).length;
+      const subscriptionsRefunded = group.filter((c) => c.firstOrderRefunded).length;
       return {
         plan,
         totalSubscribers: group.length,
@@ -1156,6 +1211,8 @@ export function computePlanMix(contracts: Contract[], dateRange: DateRange): Pla
         refundedOrders,
         totalPlanOrders: planEvents.length,
         refundRatePct: planEvents.length ? round2((100 * refundedOrders) / planEvents.length) : 0,
+        subscriptionsRefunded,
+        subscriptionRefundRatePct: group.length ? round2((100 * subscriptionsRefunded) / group.length) : 0,
         avgLtv: ltvValues.length ? round2(avg(ltvValues)) : null,
       };
     });
